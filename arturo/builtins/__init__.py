@@ -193,6 +193,8 @@ def seq_of(v: V.Value) -> List[V.Value]:
 def range_values(v: V.Range) -> range:
     """Expand an Arturo range; ``10..1`` counts down automatically."""
     start, stop, step = v.data
+    if isinstance(stop, float) or isinstance(start, float):
+        fail("cannot expand an infinite range", "Value Error")
     if step == 0:
         step = 1
     if step > 0 and start > stop:

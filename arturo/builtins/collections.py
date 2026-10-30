@@ -664,9 +664,14 @@ def _range(ev, args):
     a, b = args[0], args[1]
     step = attr(ev, "step", None)
     n = to_int(step) if step is not None else 1
+    def bound(value):
+        if value.kind == "floating" and value.data in (float("inf"), float("-inf")):
+            return value.data
+        return to_int(value)
+
     if isinstance(a, V.Range):
         return V.Range(a.start, a.stop, n)
-    return V.Range(to_int(a), to_int(b), n)
+    return V.Range(bound(a), bound(b), n)
 
 
 @impl("array")

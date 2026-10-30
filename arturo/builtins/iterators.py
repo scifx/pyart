@@ -95,6 +95,30 @@ class IntSeq:
             yield Integer(i)
 
 
+class InfSeq:
+    """Lazy sequence for infinite ranges (``1..∞``)."""
+
+    __slots__ = ("start", "step")
+
+    def __init__(self, start, step=1):
+        self.start = start
+        self.step = step
+
+    def __iter__(self):
+        Integer = V.Integer
+        i = int(self.start)
+        step = int(self.step)
+        while True:
+            yield Integer(i)
+            i += step
+
+    def __len__(self):
+        return 10 ** 12
+
+    def __getitem__(self, index):
+        return V.Integer(int(self.start) + int(index) * int(self.step))
+
+
 def iter_values(ev, collection: V.Value, nparams: int = 1) -> List[V.Value]:
     """Expand the iterable into a list of item-values.
 
@@ -103,6 +127,11 @@ def iter_values(ev, collection: V.Value, nparams: int = 1) -> List[V.Value]:
     """
     k = collection.kind
     if k == "range":
+        start, stop, step = collection.data
+        if isinstance(stop, float) and stop == float("inf"):
+            return InfSeq(int(start), int(step) if step else 1)
+        if isinstance(start, float) and start == float("-inf"):
+            return InfSeq(int(stop), -(int(step) if step else 1))
         return IntSeq(range_values(collection))
     if k in ("block", "inline"):
         items = list(collection.data)

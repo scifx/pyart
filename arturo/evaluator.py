@@ -189,13 +189,7 @@ class Evaluator:
     def eval_node(self, node) -> V.Value:
         kind = node.kind
         if kind == "constant":
-            value = node.value
-            # block literals are constant data in the AST: every evaluation
-            # hands out a fresh mutable value (Arturo's loadConstant)
-            if getattr(value, "frozen", False) and value.kind in (
-                    "block", "inline", "dictionary", "object", "string"):
-                return V.copy_value(value, deep=False)
-            return value
+            return node.value
         if kind == "variable":
             name = node.value.data
             return self.ctx.get(name)
@@ -203,11 +197,12 @@ class Evaluator:
             value = self._eval_children_first(node)
             if value is V.VOID:
                 return value
-            # strings are mutable references in Arturo: a value coming from a
-            # (frozen) source literal is detached so that in-place updates are
-            # visible through every alias of the variable
-            if value.kind == "string" and getattr(value, "frozen", False):
-                value = V.String(value.data)
+            # values are mutable references in Arturo: a value coming from a
+            # (frozen) source literal is detached when bound to a variable, so
+            # in-place updates are visible through every alias of it
+            if getattr(value, "frozen", False) and value.kind in (
+                    "string", "block", "inline", "dictionary", "object"):
+                value = V.copy_value(value, deep=False)
             self.ctx.set(node.value.data, value)
             return value
         if kind == "attribute":
