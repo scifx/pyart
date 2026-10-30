@@ -188,7 +188,13 @@ class Evaluator:
     def eval_node(self, node) -> V.Value:
         kind = node.kind
         if kind == "constant":
-            return node.value
+            value = node.value
+            # block literals are constant data in the AST: every evaluation
+            # hands out a fresh mutable value (Arturo's loadConstant)
+            if getattr(value, "frozen", False) and value.kind in (
+                    "block", "inline", "dictionary", "object", "string"):
+                return V.copy_value(value, deep=False)
+            return value
         if kind == "variable":
             name = node.value.data
             return self.ctx.get(name)

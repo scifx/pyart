@@ -665,6 +665,21 @@ def _convert_one(ev, name: str, value: V.Value) -> V.Value:
             return value
         if value.kind == "object":
             return V.Dictionary(dict(value.data))
+        if value.kind in ("block", "inline"):
+            items = value.data
+            out = {}
+            i = 0
+            while i < len(items):
+                key = items[i]
+                if isinstance(key, V.Label):
+                    name = key.data
+                elif isinstance(key, (V.Literal, V.Word, V.String)):
+                    name = key.data
+                else:
+                    name = V.to_string(key)
+                out[name] = items[i + 1] if i + 1 < len(items) else V.NULL
+                i += 2
+            return V.Dictionary(out)
         return V.Dictionary({})
     if name == "range":
         if value.kind == "range":
@@ -1205,14 +1220,10 @@ def _continue(ev, args):
 @impl("ensure")
 def _ensure(ev, args):
     message = attr(ev, "message", None)
-    checks = args[0].data if isinstance(args[0], V.Block) and not _looks_like_code(args[0]) else [args[0]]
-    for check in args[0].data if isinstance(args[0], V.Block) else [args[0]]:
-        value = ev.eval_value(check)
-        if value is V.VOID:
-            continue
-        if not V.is_true(value):
-            text = message.data if isinstance(message, V.String) else "Assertion failed"
-            raise ArturoError("Assertion Failed", text)
+    value = ev.do_block(args[0]) if isinstance(args[0], V.Block) else args[0]
+    if value is not V.VOID and not V.is_true(value):
+        text = message.data if isinstance(message, V.String) else "Assertion failed"
+        raise ArturoError("Assertion Failed", text)
     return VOID
 
 

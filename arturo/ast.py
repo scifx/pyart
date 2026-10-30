@@ -115,7 +115,7 @@ class AstBuilder:
     @staticmethod
     def _constant(value: V.Value) -> Node:
         """Constants are frozen: mutating them copies first (copy-on-write)."""
-        if value.kind in ("block", "inline", "dictionary", "object"):
+        if value.kind in ("block", "inline", "dictionary", "object", "string"):
             V.freeze(value)
         return Node("constant", 0, value=value)
 

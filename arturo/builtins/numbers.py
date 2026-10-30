@@ -263,6 +263,20 @@ _pred("even?", lambda x: x % 2 == 0)
 _pred("odd?", lambda x: x % 2 != 0)
 _pred("zero?", lambda x: x == 0)
 _pred("one?", lambda x: x == 1)
+
+
+@impl("one?")
+def _one_q(ev, args):
+    value = args[0]
+    if value.kind in ("block", "inline"):
+        return V.Logical(len(value.data) == 1)
+    if value.kind in ("dictionary", "object"):
+        return V.Logical(len(value.data) == 1)
+    if is_num(value):
+        return V.Logical(to_number(value) == 1)
+    if value.kind == "null":
+        return V.Logical(False)
+    return V.Logical(True)
 _pred("positive?", lambda x: x > 0)
 _pred("negative?", lambda x: x < 0)
 

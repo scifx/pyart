@@ -701,7 +701,8 @@ def _union(ev, args):
 @impl("intersection")
 def _intersection(ev, args):
     a, b = _set_of(args[0]), _set_of(args[1])
-    return V.Block([x for x in a if any(V.same_value(x, y) for y in b)])
+    # the result keeps the order of the second collection
+    return V.Block([y for y in b if any(V.same_value(y, x) for x in a)])
 
 
 @impl("difference")

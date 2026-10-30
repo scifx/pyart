@@ -291,11 +291,9 @@ def inplace(ev, arg):
     cls = arg.__class__
     if cls is V.Literal or cls is V.PathLiteral:
         getter, setter = ev.inplace_target(arg)
-        value = getter()
-        if getattr(value, "frozen", False):
-            value = V.copy_value(value, deep=False)
-        return value, setter
-    if cls is V.Block or cls is V.Inline or cls is V.Dictionary or cls is V.Object:
+        return getter(), setter
+    if (cls is V.Block or cls is V.Inline or cls is V.Dictionary
+            or cls is V.Object or cls is V.String or cls is V.Binary):
         # a plain expression argument is never mutated in place: mutating
         # builtins work on a copy of it (``sort xs`` leaves ``xs`` untouched)
         return V.copy_value(arg, deep=False), None
