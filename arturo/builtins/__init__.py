@@ -288,17 +288,16 @@ def inplace(ev, arg):
     argument is a literal (``'xs ++ 4``); a plain expression argument gets a
     copy (``y: sort xs`` leaves ``xs`` untouched).
     """
-    if isinstance(arg, (V.Literal, V.PathLiteral)):
+    cls = arg.__class__
+    if cls is V.Literal or cls is V.PathLiteral:
         getter, setter = ev.inplace_target(arg)
         value = getter()
         if getattr(value, "frozen", False):
             value = V.copy_value(value, deep=False)
         return value, setter
-    # a plain expression argument is never mutated in place: mutating builtins
-    # work on a copy of it (``sort xs`` leaves ``xs`` untouched)
-    if isinstance(arg, (V.Block, V.Inline, V.Dictionary, V.Object)):
-        return V.copy_value(arg, deep=False), None
-    if getattr(arg, "frozen", False):
+    if cls is V.Block or cls is V.Inline or cls is V.Dictionary or cls is V.Object:
+        # a plain expression argument is never mutated in place: mutating
+        # builtins work on a copy of it (``sort xs`` leaves ``xs`` untouched)
         return V.copy_value(arg, deep=False), None
     return arg, None
 

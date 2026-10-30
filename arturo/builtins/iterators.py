@@ -181,17 +181,38 @@ def _run(ev, args, mode: str):
     results: List[V.Value] = []
     last: V.Value = V.NULL
 
+    # hoist the per-iteration work out of the loop: the action block is the
+    # same tree for every item
+    tree = ev._tree_for(action) if isinstance(action, V.Block) else None
+    eval_node = ev.eval_node
+    ctx = ev.ctx
+    single_name = names[0] if len(names) == 1 else None
+    items_len = len(items)
+
     with protected(ev, protect):
         i = 0
         while True:
-            if i >= len(items):
-                if not forever or not items:
+            if i >= items_len:
+                if not forever or not items_len:
                     break
                 i = 0
             item = items[i]
-            _apply_item(ev, names, item, index_name, i)
+            if single_name is not None and index_name is None:
+                ctx.set(single_name, item)
+            else:
+                _apply_item(ev, names, item, index_name, i)
             try:
-                if mode == "loop":
+                if tree is not None:
+                    if mode == "loop":
+                        saved_unscoped = ctx.unscoped
+                        ctx.unscoped = True
+                        try:
+                            value = eval_node(tree)
+                        finally:
+                            ctx.unscoped = saved_unscoped
+                    else:
+                        value = eval_node(tree)
+                elif mode == "loop":
                     value = ev.do_block_unscoped(action)
                 else:
                     value = ev.do_block(action)
@@ -294,7 +315,8 @@ def _fold(ev, args):
     names = param_names(params)
     seed = attr(ev, "seed", MISSING)
     right = attr_true(ev, "right")
-    items = iter_values(ev, collection, len(names) if names else 1)
+    # the first parameter is the accumulator, the rest destructure each item
+    items = iter_values(ev, collection, max(1, len(names) - 1))
     if right:
         items = list(reversed(items))
 

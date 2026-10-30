@@ -48,8 +48,12 @@ def _add_values(a: V.Value, b: V.Value) -> V.Value:
 
 @impl("add")
 def _add(ev, args):
-    a, setter = _inplace(ev, args[0])
-    result = _add_values(a, args[1])
+    a = args[0]
+    b = args[1]
+    if a.kind == "integer" and b.kind == "integer":
+        return V.Integer(a.data + b.data)
+    a, setter = _inplace(ev, a)
+    result = _add_values(a, b)
     if setter:
         setter(result)
     return result
@@ -87,8 +91,11 @@ def _inc(ev, args):
 
 @impl("sub")
 def _sub(ev, args):
-    a, setter = _inplace(ev, args[0])
+    a = args[0]
     b = args[1]
+    if a.kind == "integer" and b.kind == "integer":
+        return V.Integer(a.data - b.data)
+    a, setter = _inplace(ev, a)
     if is_num(a) and is_num(b):
         result = num_result(to_number(a) - to_number(b))
     elif a.kind == "quantity" and b.kind == "quantity":
@@ -119,8 +126,11 @@ def _dec(ev, args):
 
 @impl("mul")
 def _mul(ev, args):
-    a, setter = _inplace(ev, args[0])
+    a = args[0]
     b = args[1]
+    if a.kind == "integer" and b.kind == "integer":
+        return V.Integer(a.data * b.data)
+    a, setter = _inplace(ev, a)
     if is_num(a) and is_num(b):
         result = num_result(to_number(a) * to_number(b))
     elif a.kind in ("string", "block", "inline", "char") and b.kind == "integer":
@@ -193,8 +203,16 @@ def _fdiv(ev, args):
 
 @impl("mod")
 def _mod(ev, args):
-    a, setter = _inplace(ev, args[0])
+    a = args[0]
     b = args[1]
+    if a.kind == "integer" and b.kind == "integer":
+        y = b.data
+        if y == 0:
+            raise ArturoError("Arithmetic Error", "Division by zero")
+        x = a.data
+        r = abs(x) % abs(y)
+        return V.Integer(r if x >= 0 else -r)
+    a, setter = _inplace(ev, a)
     x, y = to_number(a), to_number(b)
     if y == 0:
         raise ArturoError("Arithmetic Error", "Division by zero")
@@ -286,7 +304,11 @@ def _max(ev, args):
 # ---------------------------------------------------------------------------
 @impl("equal?")
 def _equal(ev, args):
-    return V.Logical(V.same_value(args[0], args[1]))
+    a, b = args
+    if a.kind == b.kind:
+        if a.kind in ("integer", "string", "logical", "char"):
+            return V.TRUE if a.data == b.data else V.FALSE
+    return V.Logical(V.same_value(a, b))
 
 
 @impl("notEqual?")

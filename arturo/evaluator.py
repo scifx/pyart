@@ -116,7 +116,7 @@ class Context:
                 or self.library.constant(name) is not None)
 
     def set(self, name: str, value: V.Value) -> None:
-        if self.frames and not self.inline_frames[-1]:
+        if self.frames and not self.inline_frames[-1]:  # fast path below
             frame = self.frames[-1]
             if name not in frame:
                 frame[name] = self.syms.get(name, MISSING)
@@ -233,8 +233,9 @@ class Evaluator:
         return result
 
     def _eval_call(self, node):
+        ctx = self.ctx
         # `else` needs the value the previous statement pushed
-        self.ctx.prev_pushed = self.ctx.last_pushed
+        ctx.prev_pushed = ctx.last_pushed
         args: List[V.Value] = []
         # children are evaluated right-to-left
         for child in reversed(node.children):
@@ -246,15 +247,25 @@ class Evaluator:
             args.append(value)
         args.reverse()
 
-        fn = self._resolve_callable(node.name)
+        name = node.name
+        fn = ctx.syms.get(name)
+        if fn is None or not isinstance(fn, V.Function):
+            fn = node.cache
+            if fn is None:
+                fn = self._resolve_callable(name)
+                node.cache = fn
         # a call starts a fresh (scoped) evaluation context: value collection
         # only applies to the statement level of an unscoped block
-        saved_unscoped = self.ctx.unscoped
-        self.ctx.unscoped = False
-        try:
-            result = self.call(fn, args, name=node.name)
-        finally:
-            self.ctx.unscoped = saved_unscoped
+        saved_unscoped = ctx.unscoped
+        if saved_unscoped:
+            ctx.unscoped = False
+        impl = fn.impl
+        if impl is not None:
+            result = impl(self, args)
+        else:
+            result = self._call_user(fn, args, name)
+        if saved_unscoped:
+            ctx.unscoped = saved_unscoped
         if result is not V.VOID:
             self.ctx.last_pushed = result
         return result
@@ -416,12 +427,15 @@ class Evaluator:
     def _tree_for(self, block: V.Block):
         from . import ast as A
 
-        key = id(block)
-        cached = self._ast_cache.get(key)
-        if cached is not None and cached[0] == len(block.data) and cached[1] is block.data:
-            return cached[2]
+        data = block.data
+        version = self.ctx.library._version
+        if getattr(block, "_tree_data", None) is data and \
+                getattr(block, "_tree_version", None) == version:
+            return block._tree
         tree = A.build(block, self.ctx.library, self.ctx.syms)
-        self._ast_cache[key] = (len(block.data), block.data, tree)
+        block._tree = tree
+        block._tree_data = data
+        block._tree_version = version
         return tree
 
     # -- helpers for builtins -------------------------------------------

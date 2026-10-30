@@ -30,13 +30,15 @@ DYNAMIC_INFIX: dict = {}
 class Node:
     """A node of the generated tree."""
 
-    __slots__ = ("kind", "children", "parent", "params", "arity", "value", "name")
+    __slots__ = ("kind", "children", "parent", "params", "arity", "value", "name",
+                 "cache")
 
     def __init__(self, kind: str, arity: int = -1, value=None, name: str = ""):
         self.kind = kind
         self.children: List["Node"] = []
         self.parent: Optional["Node"] = None
         self.params = 0
+        self.cache = None
         self.arity = arity
         self.value = value
         self.name = name
