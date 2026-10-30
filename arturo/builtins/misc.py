@@ -25,29 +25,60 @@ def _path_of(value: V.Value) -> str:
     return V.to_string(value)
 
 
-@builtin("read", arity=1, attrs=["json", "lines", "binary", "file", "csv", "with"])
+@builtin("read", arity=1, attrs=["json", "lines", "binary", "file", "csv", "withHeaders",
+                                 "delimiter", "xml", "html", "markdown", "toml", "async"])
 def _read(ev, args):
     path = _path_of(args[0])
     lines = attr_true(ev, "lines")
     binary = attr_true(ev, "binary")
     as_json = attr_true(ev, "json")
-    try:
-        if binary:
+    if binary:
+        try:
             with open(path, "rb") as fh:
                 return V.Binary(fh.read())
+        except OSError as exc:
+            raise ArturoError("File Error", str(exc))
+    # `read` also accepts plain data: when the argument is not a real path the
+    # string itself is the source (Arturo's getSource)
+    try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except FileNotFoundError:
-        raise ArturoError("File Error", f"File not found: {path}")
+        if attr_true(ev, "file"):
+            raise ArturoError("File Error", f"File not found: {path}")
+        text = path
     except IsADirectoryError:
         raise ArturoError("File Error", f"Is a directory: {path}")
-    except OSError as exc:
-        raise ArturoError("File Error", str(exc))
+    except OSError:
+        text = path
     if lines:
         return V.Block([V.String(x) for x in text.splitlines()])
     if as_json:
         return json_to_value(text)
+    if attr_true(ev, "csv"):
+        return _parse_csv_text(ev, text)
     return V.String(text)
+
+
+def _parse_csv_text(ev, text: str):
+    delimiter = ","
+    d = attr(ev, "delimiter", None)
+    if d is not None:
+        delimiter = V.to_string(d)
+    rows = [line.split(delimiter) for line in text.splitlines() if line != ""]
+    with_headers = attr_true(ev, "withHeaders")
+    if not with_headers:
+        return V.Block([V.Block([V.String(c) for c in row]) for row in rows])
+    if not rows:
+        return V.Block([])
+    headers = rows[0]
+    out = []
+    for row in rows[1:]:
+        d = {}
+        for i, h in enumerate(headers):
+            d[h] = V.String(row[i]) if i < len(row) else V.String("")
+        out.append(V.Dictionary(d))
+    return V.Block(out)
 
 
 @builtin("write", arity=2, attrs=["json", "directory", "append"])

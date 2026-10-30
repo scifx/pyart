@@ -429,12 +429,14 @@ class Evaluator:
 
         data = block.data
         version = self.ctx.library._version
-        if getattr(block, "_tree_data", None) is data and \
-                getattr(block, "_tree_version", None) == version:
+        if (getattr(block, "_tree_data", None) is data
+                and getattr(block, "_tree_len", -1) == len(data)
+                and getattr(block, "_tree_version", None) == version):
             return block._tree
         tree = A.build(block, self.ctx.library, self.ctx.syms)
         block._tree = tree
         block._tree_data = data
+        block._tree_len = len(data)
         block._tree_version = version
         return tree
 

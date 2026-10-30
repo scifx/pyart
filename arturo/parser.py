@@ -375,7 +375,10 @@ class Parser:
         if ch == "∅":
             self._adv()
             return V.Symbol("∅")
-        if ch in "∞∑∏∩∪⊂⊃⊆⊇∈∉∧∨⊻⊼≤≥≠→←↔⇒":
+        if ch == "∞":
+            self._adv()
+            return V.Floating(float("inf"))
+        if ch in "∑∏∩∪⊂⊃⊆⊇∈∉∧∨⊻⊼≤≥≠→←↔⇒":
             self._adv()
             return V.Symbol(ch)
         if ch in SYMBOL_CHARS:

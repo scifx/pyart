@@ -299,6 +299,8 @@ def inplace(ev, arg):
         # a plain expression argument is never mutated in place: mutating
         # builtins work on a copy of it (``sort xs`` leaves ``xs`` untouched)
         return V.copy_value(arg, deep=False), None
+    if getattr(arg, "frozen", False):
+        return V.copy_value(arg, deep=False), None
     return arg, None
 
 

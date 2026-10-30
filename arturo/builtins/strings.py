@@ -389,8 +389,15 @@ def _match_q(ev, args):
     return V.Logical(True)
 
 
-@builtin("escape", arity=1)
+_XML_ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;",
+                '"': "&quot;", "'": "&apos;"}
+
+
+@builtin("escape", arity=1, attrs=["xml", "html", "regex", "json"])
 def _escape(ev, args):
+    if attr_true(ev, "xml") or attr_true(ev, "html"):
+        text = V.to_string(args[0])
+        return V.String("".join(_XML_ESCAPES.get(ch, ch) for ch in text))
     text = _str(args[0])
     return V.String(text.encode("unicode_escape").decode("ascii"))
 

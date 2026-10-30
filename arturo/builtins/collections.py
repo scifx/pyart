@@ -94,6 +94,16 @@ def set_value(ev, container: V.Value, key: V.Value, value: V.Value) -> None:
             raise ArturoError("Index Error", f"Index out of bounds: {to_int(key)}")
         container.data[index] = value
         return
+    if k == "string":
+        index = to_int(key)
+        text = container.data
+        n = len(text)
+        if index < 0:
+            index += n
+        if index < 0 or index >= n:
+            raise ArturoError("Index Error", f"Index out of bounds: {to_int(key)}")
+        container.data = text[:index] + V.to_string(value) + text[index + 1:]
+        return
     fail(f"cannot set into {k}", "Type Error")
 
 
@@ -496,16 +506,16 @@ def sort_key(parts):
     return key
 
 
-def _sort_key_value(value: V.Value, parts=None):
+def _sort_key_value(value: V.Value, parts=None, sensitive: bool = False):
     if parts:
         for part in parts:
             value = get_value(None, value, part)
     if is_num(value):
         return (0, to_number(value))
     if value.kind == "string":
-        return (1, value.data)
+        return (1, value.data if sensitive else value.data.lower())
     if value.kind == "char":
-        return (1, value.data)
+        return (1, value.data if sensitive else value.data.lower())
     if value.kind == "logical":
         return (2, 1 if value.data else 0)
     return (3, V.to_string(value))
@@ -525,7 +535,7 @@ def _sort(ev, args):
 
     key_parts = None
     if by is not None:
-        if isinstance(by, V.Literal):
+        if isinstance(by, (V.Literal, V.String, V.Char, V.Word, V.Integer)):
             key_parts = [by]
         elif isinstance(by, V.Block):
             key_parts = list(by.data)
@@ -535,7 +545,7 @@ def _sort(ev, args):
         if key_parts:
             for part in key_parts:
                 target = get_value(ev, target, part)
-            return _sort_key_value(target)
+            return _sort_key_value(target, sensitive=sensitive)
         if is_num(item):
             return (0, to_number(item))
         if item.kind in ("string", "char"):
