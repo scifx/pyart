@@ -190,6 +190,11 @@ class Evaluator:
             value = self._eval_children_first(node)
             if value is V.VOID:
                 return value
+            # strings are mutable references in Arturo: a value coming from a
+            # (frozen) source literal is detached so that in-place updates are
+            # visible through every alias of the variable
+            if value.kind == "string" and getattr(value, "frozen", False):
+                value = V.String(value.data)
             self.ctx.set(node.value.data, value)
             return value
         if kind == "attribute":

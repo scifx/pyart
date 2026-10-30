@@ -7,6 +7,7 @@ uses on almost every line.
 from __future__ import annotations
 
 import math
+import re as _re
 from fractions import Fraction
 from typing import Dict, List
 
@@ -576,8 +577,14 @@ def _convert_one(ev, name: str, value: V.Value) -> V.Value:
 
             return V.String(nimtime.format(value.data, fmt.data))
         if fmt is not None and is_num(value):
+            pattern = fmt.data
+            if "%" not in pattern and _re.match(r"^[-+ 0#]*\d*[dxXobfeEgGsc]$", pattern):
+                pattern = "%" + pattern
             try:
-                return V.String(format(float(to_number(value)), fmt.data))
+                number = to_number(value)
+                if pattern.endswith(("d", "i", "x", "X", "o", "b")):
+                    return V.String(pattern % int(number))
+                return V.String(pattern % number)
             except (ValueError, TypeError):
                 pass
         if value.kind == "block":
@@ -623,6 +630,10 @@ def _convert_one(ev, name: str, value: V.Value) -> V.Value:
             return V.Char(chr(value.data))
         return V.Char(V.to_string(value)[:1])
     if name == "block":
+        if value.kind == "string":
+            from ..parser import Parser
+
+            return V.Block(Parser(value.data).parse())
         return V.Block(seq_of(value) if value.kind not in ("null", "void") else [])
     if name == "inline":
         return V.Inline(seq_of(value))

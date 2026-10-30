@@ -268,14 +268,14 @@ def freeze(value: "Value") -> "Value":
         item = stack.pop()
         if getattr(item, "frozen", None) is True:
             continue
-        if item.kind in ("block", "inline", "dictionary", "object"):
+        if item.kind in ("block", "inline", "dictionary", "object", "string"):
             try:
                 item.frozen = True
             except AttributeError:  # pragma: no cover - defensive
                 continue
             if item.kind in ("dictionary", "object"):
                 stack.extend(item.data.values())
-            else:
+            elif item.kind in ("block", "inline"):
                 stack.extend(item.data)
     return value
 
@@ -673,6 +673,8 @@ def copy_value(v: Value, deep: bool = True) -> Value:
         return Quantity(copy_value(v.value), v.unit)
     if k == "range":
         return Range(*v.data)
+    if k == "string":
+        return String(v.data)
     return v
 
 

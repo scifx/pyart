@@ -191,6 +191,17 @@ def _prime_q(ev, args):
 @impl("digits")
 def _digits(ev, args):
     value = args[0]
+    base = attr(ev, "base", None)
+    if base is not None and value.kind == "integer":
+        b = to_int(base)
+        n = abs(value.data)
+        out = []
+        while True:
+            out.append(V.Integer(n % b))
+            n //= b
+            if n == 0:
+                break
+        return V.Block(list(reversed(out)))
     if value.kind == "integer":
         return V.Block([V.Integer(int(c)) for c in str(abs(value.data))])
     if value.kind == "string":

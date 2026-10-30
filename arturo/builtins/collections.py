@@ -112,7 +112,8 @@ def _append(ev, args):
             target.data.append(value)
         result = target
     elif target.kind == "string":
-        result = V.String(target.data + V.to_string(value))
+        target.data = target.data + V.to_string(value)
+        result = target
     elif target.kind == "char":
         result = V.String(target.data + V.to_string(value))
     elif target.kind == "dictionary":
@@ -178,7 +179,8 @@ def _remove(ev, args):
                 text = text.replace(V.to_string(item), "")
         else:
             text = text.replace(V.to_string(value), "")
-        result = V.String(text)
+        target.data = text
+        result = target
     else:
         fail(f"cannot remove from {target.kind}", "Type Error")
 
@@ -367,6 +369,8 @@ def _contains(ev, args):
     if k in ("block", "inline"):
         return V.Logical(_block_contains(collection, value))
     if k == "string":
+        if isinstance(value, V.Regex):
+            return V.Logical(value.compiled.search(collection.data) is not None)
         return V.Logical(V.to_string(value) in collection.data)
     if k in ("dictionary", "object"):
         name = value.data if isinstance(value, (V.Literal, V.Word, V.String)) else V.to_string(value)
@@ -391,6 +395,10 @@ def _in(ev, args):
 @impl("index")
 def _index(ev, args):
     collection, value = args
+    if collection.kind == "string":
+        needle = V.to_string(value)
+        found = collection.data.find(needle)
+        return V.Integer(found) if found >= 0 else V.NULL
     items = _items_of(ev, collection)
     if isinstance(items, list) and len(items) >= 64:
         try:
@@ -686,7 +694,12 @@ def _intersection(ev, args):
 @impl("difference")
 def _difference(ev, args):
     a, b = _set_of(args[0]), _set_of(args[1])
-    return V.Block([x for x in a if not any(V.same_value(x, y) for y in b)])
+    symmetric = attr_true(ev, "symmetric")
+    left = [x for x in a if not any(V.same_value(x, y) for y in b)]
+    if not symmetric:
+        return V.Block(left)
+    right = [y for y in b if not any(V.same_value(y, x) for x in a)]
+    return V.Block(left + right)
 
 
 @impl("powerset")
@@ -702,12 +715,19 @@ def _powerset(ev, args):
 @impl("subset?")
 def _subset(ev, args):
     a, b = _set_of(args[0]), _set_of(args[1])
-    return V.Logical(all(any(V.same_value(x, y) for y in b) for x in a))
+    inside = all(any(V.same_value(x, y) for y in b) for x in a)
+    if inside and attr_true(ev, "proper"):
+        return V.Logical(len(a) < len(b))
+    return V.Logical(inside)
 
 
 @impl("superset?")
 def _superset(ev, args):
-    return _subset(ev, [args[1], args[0]])
+    result = _subset(ev, [args[1], args[0]])
+    if attr_true(ev, "proper"):
+        return V.Logical(V.is_true(result) and
+                         len(_set_of(args[0])) > len(_set_of(args[1])))
+    return result
 
 
 @impl("disjoint?")
@@ -765,7 +785,10 @@ def _rotate(ev, args):
     if not items:
         return collection
     n = to_int(amount) % len(items)
-    rotated = items[-n:] + items[:-n] if n else items[:]
+    if attr_true(ev, "left"):
+        rotated = items[n:] + items[:n]
+    else:
+        rotated = items[-n:] + items[:-n] if n else items[:]
     if collection.kind == "string":
         return V.String("".join(V.to_string(x) for x in rotated))
     return V.Block(rotated)

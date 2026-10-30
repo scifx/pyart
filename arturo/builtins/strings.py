@@ -41,8 +41,7 @@ def _capitalize(ev, args):
     # ``capitalize`` upper-cases the first letter of every word and leaves the
     # rest of the text untouched (unless ``.preserve`` is not given... it is
     # always untouched in Arturo)
-    result = _re.sub(r"(?<![^\s])\s*\w", lambda m: m.group(0).upper(), text)
-    return V.String(result)
+    return V.String(text[:1].upper() + text[1:])
 
 
 @impl("strip")
@@ -99,21 +98,30 @@ def _truncate(ev, args):
 @impl("replace")
 def _replace(ev, args):
     text, what, replacement = args
+    setter = None
+    if isinstance(text, (V.Literal, V.PathLiteral)):
+        getter, setter = ev.inplace_target(text)
+        text = getter()
+        if text.kind == "string" and getattr(text, "frozen", False):
+            text = V.String(text.data)
+    elif text.kind == "string":
+        # a plain expression argument is never mutated in place
+        text = V.String(text.data)
+
     if isinstance(what, V.Regex):
-        count = 1 if attr_true(ev, "once") else 0
-        first_only = attr_true(ev, "first") or attr_true(ev, "firstOnly")
-        if first_only:
+        count = 0
+        if attr_true(ev, "once") or attr_true(ev, "first") or attr_true(ev, "firstOnly"):
             count = 1
-        return V.String(what.compiled.sub(_str(replacement), _str(text), count=count))
-    if text.kind in ("block", "inline"):
-        out = []
-        for item in text.data:
-            out.append(replacement if V.same_value(item, what) else item)
-        return V.Block(out)
-    s = _str(text)
-    a = _str(what)
-    b = _str(replacement)
-    return V.String(s.replace(a, b))
+        repl = _re.sub(r"\$(\d+)", lambda m: "\\" + m.group(1), _str(replacement))
+        result = V.String(what.compiled.sub(repl, text.data, count=count))
+    elif isinstance(text, V.Block):
+        result = V.Block([replacement if V.same_value(item, what) else item
+                          for item in text.data])
+    else:
+        result = V.String(text.data.replace(_str(what), _str(replacement)))
+    if setter is not None:
+        setter(result)
+    return result
 
 
 def _split(ev, args):
@@ -152,15 +160,14 @@ def _split(ev, args):
         if isinstance(by, V.Regex):
             return V.Block([V.String(x) for x in by.compiled.split(s)])
         if by.kind in ("block", "inline"):
-            # split on any of the given separators
-            parts = [s]
-            for sep in by.data:
-                chunk = _str(sep)
-                out: List[str] = []
-                for part in parts:
-                    out.extend(part.split(chunk))
-                parts = out
-            return V.Block([V.String(x) for x in parts])
+            # split on any of the given separators (longest match first)
+            seps = sorted((_str(sep) for sep in by.data), key=len, reverse=True)
+            seps = [x for x in seps if x]
+            if not seps:
+                return V.Block([V.String(s)])
+            pattern = "|".join(_re.escape(x) for x in seps)
+            parts = _re.split(pattern, s)
+            return V.Block([V.String(x) for x in parts if x != ""])
         sep = _str(by)
         if sep == "":
             return V.Block([V.String(c) for c in s])
@@ -390,12 +397,28 @@ def _unescape(ev, args):
     return V.String(text.encode("ascii", "backslashreplace").decode("unicode_escape"))
 
 
-@builtin("encode", arity=1)
+@builtin("encode", arity=1, attrs=["url", "spaces", "slashes", "from", "to", "codec"])
 def _encode(ev, args):
+    if attr_true(ev, "url"):
+        return V.String(_url_encode(_str(args[0]), attr_true(ev, "spaces")))
     codec = attr(ev, "codec", None)
-    name = codec.data if isinstance(codec, V.String) else "utf-8"
-    return V.String(_str(args[0]).encode(name).hex().upper() if False else
-                    _b64(args[0], name, True))
+    name = codec.data if isinstance(codec, V.String) else "base64"
+    return V.String(_b64(args[0], name, True))
+
+
+_UNRESERVED = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
+
+
+def _url_encode(text: str, encode_spaces: bool = False) -> str:
+    out = []
+    for ch in text:
+        if ch in _UNRESERVED:
+            out.append(ch)
+        elif ch == " ":
+            out.append("%20" if encode_spaces else "+")
+        else:
+            out.append("".join("%%%02X" % b for b in ch.encode("utf-8")))
+    return "".join(out)
 
 
 def _b64(value, codec, encode):
@@ -416,8 +439,12 @@ def _b64(value, codec, encode):
     return text
 
 
-@builtin("decode", arity=1)
+@builtin("decode", arity=1, attrs=["url", "codec"])
 def _decode(ev, args):
+    if attr_true(ev, "url"):
+        from urllib.parse import unquote_plus
+
+        return V.String(unquote_plus(_str(args[0])))
     codec = attr(ev, "codec", None)
     name = codec.data if isinstance(codec, V.String) else "base64"
     return V.String(_b64(args[0], name, False))
