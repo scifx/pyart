@@ -80,6 +80,10 @@ class Context:
         self.prev_pushed: Optional[V.Value] = None
         self.error_kind = "Script Error"
         self.trace: List[str] = []
+        # stack of value collectors: ``@[ loop ... ]`` gathers every value the
+        # enclosed loops push (see ``Evaluator.emit``)
+        self.collectors: List[List[V.Value]] = []
+        self.emitted = False
         self.depth = 0
         self.cwd = None
 
@@ -203,10 +207,16 @@ class Evaluator:
         if kind == "root":
             result: V.Value = V.VOID
             for child in node.children:
+                collector = self.ctx.collectors[-1] if self.ctx.collectors else None
+                before = len(collector) if collector is not None else 0
                 value = self.eval_node(child)
                 if value is not V.VOID:
                     result = value
                     self.ctx.last_pushed = value
+                    # a statement that only ran a collector-aware block has
+                    # already contributed its values
+                    if collector is not None and len(collector) == before:
+                        collector.append(value)
             return result
         raise ArturoError("VM Error", f"Unknown node kind: {kind}")
 
@@ -293,9 +303,11 @@ class Evaluator:
                 f"Not enough parameters\nCannot perform: {name}",
             )
         if fn.memoize:
-            key = tuple(id(a) for a in args)
+            key = tuple(V.value_key(a) for a in args)
             if not hasattr(fn, "_memo"):
                 fn._memo = {}
+            if len(fn._memo) > 200_000:
+                fn._memo.clear()
             if key in fn._memo:
                 return fn._memo[key]
 
@@ -329,6 +341,21 @@ class Evaluator:
         return result
 
     # -- blocks ----------------------------------------------------------
+    # -- value collection (for ``@[ ... ]``) -----------------------------
+    def emit(self, value: V.Value) -> None:
+        """Push a value into the active collector (inline block or none)."""
+        if self.ctx.collectors:
+            self.ctx.collectors[-1].append(value)
+
+    def collect_block(self, block: V.Block) -> List[V.Value]:
+        items: List[V.Value] = []
+        self.ctx.collectors.append(items)
+        try:
+            self.do_block(block)
+        finally:
+            self.ctx.collectors.pop()
+        return items
+
     def do_block(self, block: V.Value, scoped: bool = False) -> V.Value:
         """Evaluate a block (or inline) in the current scope."""
         if not isinstance(block, V.Block):

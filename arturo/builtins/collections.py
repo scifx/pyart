@@ -102,9 +102,7 @@ def set_value(ev, container: V.Value, key: V.Value, value: V.Value) -> None:
 def _append(ev, args):
     target, value = args[0], args[1]
     setter = None
-    if isinstance(target, (V.Literal, V.PathLiteral)):
-        target, setter = inplace(ev, target)
-        target = target
+    target, setter = inplace(ev, target)
 
     result = None
     if target.kind in ("block", "inline"):
@@ -134,12 +132,27 @@ def _append(ev, args):
     return result
 
 
-@impl("remove")
+@builtin("remove", arity=2, attrs=["index", "key", "prefix", "suffix", "once"])
 def _remove(ev, args):
     target, value = args[0], args[1]
     setter = None
-    if isinstance(target, (V.Literal, V.PathLiteral)):
-        target, setter = inplace(ev, target)
+    target, setter = inplace(ev, target)
+
+    if attr_true(ev, "key") and target.kind in ("dictionary", "object"):
+        key = value.data if isinstance(value, (V.Literal, V.Word, V.String)) else V.to_string(value)
+        target.data.pop(key, None)
+        if setter:
+            setter(target)
+        return target
+
+    index = attr(ev, "index", None)
+    if index is not None and target.kind in ("block", "inline"):
+        i = to_int(value)
+        if 0 <= i < len(target.data):
+            del target.data[i]
+        if setter:
+            setter(target)
+        return target
 
     if target.kind in ("block", "inline"):
         if isinstance(value, V.Block):
@@ -172,8 +185,7 @@ def _remove(ev, args):
 def _insert(ev, args):
     collection, index, value = args
     setter = None
-    if isinstance(collection, (V.Literal, V.PathLiteral)):
-        collection, setter = inplace(ev, collection)
+    collection, setter = inplace(ev, collection)
     if collection.kind not in ("block", "inline"):
         fail("cannot insert into non-block", "Type Error")
     idx = to_int(index)
@@ -187,8 +199,7 @@ def _insert(ev, args):
 def _prepend(ev, args):
     collection, value = args
     setter = None
-    if isinstance(collection, (V.Literal, V.PathLiteral)):
-        collection, setter = inplace(ev, collection)
+    collection, setter = inplace(ev, collection)
     if collection.kind in ("block", "inline"):
         if isinstance(value, V.Block):
             collection.data[0:0] = value.data
@@ -368,8 +379,7 @@ def _empty_q(ev, args):
 def _empty(ev, args):
     value = args[0]
     setter = None
-    if isinstance(value, (V.Literal, V.PathLiteral)):
-        value, setter = inplace(ev, value)
+    value, setter = inplace(ev, value)
     if value.kind in ("block", "inline"):
         value.data.clear()
         result = value
@@ -409,8 +419,7 @@ def _slice(ev, args):
 def _reverse(ev, args):
     value = args[0]
     setter = None
-    if isinstance(value, (V.Literal, V.PathLiteral)):
-        value, setter = inplace(ev, value)
+    value, setter = inplace(ev, value)
     if value.kind in ("block", "inline"):
         value.data.reverse()
         result = value
@@ -451,8 +460,7 @@ def _sort_key_value(value: V.Value, parts=None):
 def _sort(ev, args):
     collection = args[0]
     setter = None
-    if isinstance(collection, (V.Literal, V.PathLiteral)):
-        collection, setter = inplace(ev, collection)
+    collection, setter = inplace(ev, collection)
 
     descending = attr_true(ev, "descending")
     sensitive = attr_true(ev, "sensitive")
@@ -513,8 +521,7 @@ def _sorted_q(ev, args):
 def _shuffle(ev, args):
     value = args[0]
     setter = None
-    if isinstance(value, (V.Literal, V.PathLiteral)):
-        value, setter = inplace(ev, value)
+    value, setter = inplace(ev, value)
     if value.kind in ("block", "inline"):
         _random.shuffle(value.data)
         result = value
@@ -533,8 +540,7 @@ def _shuffle(ev, args):
 def _unique(ev, args):
     value = args[0]
     setter = None
-    if isinstance(value, (V.Literal, V.PathLiteral)):
-        value, setter = inplace(ev, value)
+    value, setter = inplace(ev, value)
     if value.kind not in ("block", "inline"):
         fail("cannot get unique items of non-block", "Type Error")
     out: List[V.Value] = []
@@ -802,8 +808,7 @@ def _drop(ev, args):
 def _chop(ev, args):
     value = args[0]
     setter = None
-    if isinstance(value, (V.Literal, V.PathLiteral)):
-        value, setter = inplace(ev, value)
+    value, setter = inplace(ev, value)
     if value.kind in ("block", "inline") and value.data:
         value.data.pop()
         result = value

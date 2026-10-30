@@ -527,6 +527,26 @@ def new_value_like(v: Value):
 # ---------------------------------------------------------------------------
 # Equality
 # ---------------------------------------------------------------------------
+def value_key(v: Value):
+    """A hashable, value-based key (used for function memoization)."""
+    k = v.kind
+    if k in ("integer", "floating", "rational", "logical", "string", "char",
+             "word", "literal", "label", "symbol", "type", "version", "color",
+             "null", "nothing"):
+        return (k, v.data)
+    if k in ("block", "inline"):
+        return (k, tuple(value_key(x) for x in v.data))
+    if k in ("dictionary", "object"):
+        return (k, tuple(sorted((name, value_key(val)) for name, val in v.data.items())))
+    if k == "range":
+        return (k, v.start, v.stop, v.step)
+    if k == "date":
+        return (k, str(v.data))
+    if k == "function":
+        return ("function", id(v))
+    return (k, id(v))
+
+
 def same_value(a: Value, b: Value) -> bool:
     """Structural equality used by ``=`` / ``equal?``."""
     if a is b:

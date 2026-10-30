@@ -280,10 +280,17 @@ def equals(a: V.Value, b: V.Value) -> bool:
 # Attribute helpers
 # ---------------------------------------------------------------------------
 def inplace(ev, arg):
-    """Resolve a literal/path-literal argument to ``(value, setter)``."""
+    """Resolve a literal/path-literal argument to ``(value, setter)``.
+
+    Arturo values are references, but builtins only mutate *in place* when the
+    argument is a literal (``'xs ++ 4``); a plain expression argument gets a
+    copy (``y: sort xs`` leaves ``xs`` untouched).
+    """
     if isinstance(arg, (V.Literal, V.PathLiteral)):
         getter, setter = ev.inplace_target(arg)
         return getter(), setter
+    if arg.kind in ("block", "inline", "dictionary", "object"):
+        return V.copy_value(arg, deep=False), None
     return arg, None
 
 

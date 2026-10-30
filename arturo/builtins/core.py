@@ -781,7 +781,7 @@ def _none_q(ev, args):
 def _array(ev, args):
     value = args[0]
     if isinstance(value, V.Block):
-        return V.Block(_eval_collect(ev, value))
+        return V.Block(ev.collect_block(value))
     return V.Block([value])
 
 
@@ -1006,13 +1006,15 @@ def _until(ev, args):
     from ..evaluator import BreakSignal, ContinueSignal
 
     result: V.Value = V.NULL
-    while not V.is_truthy(_condition_value(ev, cond)):
+    while True:
         try:
             result = ev.do_block(body)
         except BreakSignal:
             break
         except ContinueSignal:
-            continue
+            pass
+        if V.is_truthy(_condition_value(ev, cond)):
+            break
     return result
 
 
