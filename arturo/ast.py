@@ -580,6 +580,9 @@ def _compile_node(node) -> None:
                 if ev.ctx.syms.get(_name) is None:
                     a = _p0(ev)
                     b = _p1(ev)
+                    if a is V.VOID or b is V.VOID:
+                        return _dispatch(ev, _node, _name,
+                                         [x for x in (a, b) if x is not V.VOID])
                     if type(a) is V.Integer and type(b) is V.Integer:
                         x = a.data
                         y = b.data
@@ -596,6 +599,8 @@ def _compile_node(node) -> None:
 
         def _call(ev, _parts=parts, _name=name, _node=node):
             args = [part(ev) for part in reversed(_parts)]
+            if any(a is V.VOID for a in args):
+                args = [a for a in args if a is not V.VOID]
             if len(args) > 1:
                 args.reverse()
             return _dispatch(ev, _node, _name, args)

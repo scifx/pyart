@@ -234,7 +234,7 @@ def _run(ev, args, mode: str):
             else:
                 _apply_item(ev, names, item, index_name, i)
             try:
-                if body is not None and mode != "loop":
+                if body is not None and mode != "loop" and not ctx.unscoped:
                     value = body(ev)
                     if value is None:
                         value = eval_node(tree)
