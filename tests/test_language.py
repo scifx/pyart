@@ -90,11 +90,48 @@ ITERATORS = [
     ("print fold 1..5 [a b][a+b]", "15\n"),
     ("print fold 1..4 => add", "10\n"),
     ("loop 1..3 'x [print x]", "1\n2\n3\n"),
+    ('do.times: 3 [print "repeat"]', "repeat\nrepeat\nrepeat\n"),
+    ('do.times: 0 [print "never"] print "done"', "done\n"),
     ("print sum 1..10", "55\n"),
     ("print product 1..4", "24\n"),
+    ("f: function [n][counter: 0 do.times:n [counter: counter + 1] counter] print map 1..3 'n -> f n", "1 2 3 \n"),
     ("print sum [1 2 3]", "6\n"),
     ("print average [1 2 3]", "2.0\n"),
     ("print max [3 1 4]", "4\n"),
+]
+
+# ---------------------------------------------------------------------------
+# reflection and runtime documentation
+# ---------------------------------------------------------------------------
+REFLECTION = [
+    ("meta: info.get 'print print meta\\name print meta\\module print get meta\\example 0",
+     'print\nIo\nprint "Hello world!"          ; Hello world!\n'),
+    ("meta: info.get '++ print meta\\name", "append\n"),
+    ("info.get 'map | get 'example | get 0 | print",
+     "print map 1..5 [x][\n    2*x\n]\n; 2 4 6 8 10\n"),
+    ("info 'print",
+     "|" + "-" * 80 + "\n"
+     "|          print  :function                                                   Io\n"
+     "|" + "-" * 80 + "\n"
+     "|                 print given value to screen with newline\n"
+     "|" + "-" * 80 + "\n"
+     "|          usage  print value :any\n|\n"
+     "|        options  .lines -> print each value in block in a new line\n|\n"
+     "|        returns  :nothing\n"
+     "|" + "-" * 80 + "\n"),
+    ("pause 0:s print \"awake\"", "awake\n"),
+    ("print sys\\version > 0.9.0 print set? 'abs", "true\ntrue\n"),
+    ("define :cat [init: method [name][null] meow: method [][null]]\n"
+     "cat: to :cat #[] print methods cat", "init meow \n"),
+    ("define :cat [meow: method [][null]] cat: to :cat #[]\n"
+     "info.get 'cat\\meow | get 'name | print", "meow\n"),
+    ('f: function [x :integer][x] print f 7', "7\n"),
+    ("f: function [x :integer][x] m: info.get 'f print m\\args print m\\returns",
+     "[x:[:integer]]\n:nothing \n"),
+    ('''f: function [x :integer][\n    ;; description: « returns the input, with documented options\n    ;; options: [\n    ;;   multiplier: :integer « multiplier to apply\n    ;; ]\n    ;; returns: :integer\n    ;; example: {\n    ;;   f 3\n    ;; }\n    x\n]\nm: info.get 'f\nprint m\\description\nprint m\\args\nprint m\\attrs\nprint m\\returns\nprint get m\\example 0''',
+     "returns the input, with documented options\n[x:[:integer]]\n"
+     "[multiplier:[types:[:integer] description:multiplier to apply]]\n"
+     ":integer \nf 3\n"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -182,7 +219,7 @@ SEMANTICS = [
     ("print 1+2", "3\n"),
 ]
 
-ALL_CASES = (CASES + ARITHMETIC + ITERATORS + CONDITIONALS + FUNCTIONS
+ALL_CASES = (CASES + ARITHMETIC + ITERATORS + REFLECTION + CONDITIONALS + FUNCTIONS
              + STRINGS + COLLECTIONS + DATES + SEMANTICS)
 
 
@@ -196,6 +233,22 @@ def test_language() -> None:
     assert not failures, "failed cases:\n\n" + "\n\n".join(failures)
 
 
+def test_typed_function_rejects_wrong_argument_type() -> None:
+    interp = Interpreter(out=io.StringIO())
+    try:
+        interp.exec('f: function [x :integer][x] f "not an integer"')
+    except ArturoError as exc:
+        assert exc.kind == "Assertion Failed", str(exc)
+    else:  # pragma: no cover - regression guard
+        raise AssertionError("typed function accepted a string for :integer")
+
+
+def test_arg_returns_runtime_argv() -> None:
+    output = io.StringIO()
+    Interpreter(out=output, argv=["one", "two"]).exec("print arg")
+    assert output.getvalue() == "one two \n"
+
+
 def main() -> int:
     failed = 0
     for source, expected in ALL_CASES:
@@ -205,7 +258,17 @@ def main() -> int:
         except AssertionError as exc:
             failed += 1
             print(f"✗ {exc}")
-    print(f"\n{len(ALL_CASES) - failed}/{len(ALL_CASES)} language checks passed")
+    try:
+        test_typed_function_rejects_wrong_argument_type()
+        print("✓ typed function rejects an invalid argument type")
+        test_arg_returns_runtime_argv()
+        print("✓ arg returns runtime argv")
+        total = len(ALL_CASES) + 2
+    except AssertionError as exc:
+        failed += 1
+        total = len(ALL_CASES) + 2
+        print(f"✗ {exc}")
+    print(f"\n{total - failed}/{total} language checks passed")
     return 1 if failed else 0
 
 

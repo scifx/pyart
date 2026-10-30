@@ -12,7 +12,9 @@ from fractions import Fraction
 from typing import Dict, List
 
 from .. import values as V
+from .. import reflection as R
 from ..evaluator import ArturoError, BreakSignal, ContinueSignal, ReturnSignal
+from ..signatures import SIGNATURES
 from . import *
 from . import inplace
 from . import (VOID, attr, attr_true, builtin, collection_size, compare,
@@ -499,6 +501,22 @@ def _prints(ev, args):
     return _print_common(ev, args[0], newline=False)
 
 
+@impl("info")
+def _info(ev, args):
+    try:
+        requested, canonical, target = R.resolve_info_target(ev, args[0])
+    except ValueError as exc:
+        fail(str(exc), "Type Error")
+    if target is None:
+        fail(f"symbol not found: {requested}", "Name Error")
+    metadata = R.metadata_for(canonical, requested, target)
+    get_attr = attr(ev, "get", None)
+    if get_attr is not None:
+        return metadata
+    write_out(ev, R.format_info(metadata))
+    return VOID
+
+
 @builtin("arity", arity=0)
 def _arity_table(ev, args):
     """``arity`` => dictionary mapping every known name to its arity."""
@@ -895,7 +913,18 @@ def _define(ev, args):
     fields: List[str] = []
     methods: Dict[str, V.Value] = {}
     if isinstance(prototype, V.Block):
-        for item in prototype.data:
+        i = 0
+        while i < len(prototype.data):
+            item = prototype.data[i]
+            if (isinstance(item, V.Label) and i + 3 < len(prototype.data)
+                    and isinstance(prototype.data[i + 1], V.Word)
+                    and prototype.data[i + 1].data in ("method", "function")
+                    and isinstance(prototype.data[i + 2], V.Block)
+                    and isinstance(prototype.data[i + 3], V.Block)):
+                methods[item.data] = make_function(
+                    ev, prototype.data[i + 2], prototype.data[i + 3], name=item.data)
+                i += 4
+                continue
             if isinstance(item, V.Label):
                 fields.append(item.data)
             elif isinstance(item, (V.Word, V.Literal)):
@@ -906,9 +935,11 @@ def _define(ev, args):
                         fields.append(sub.data)
             elif isinstance(item, V.Dictionary):
                 for key, value in item.data.items():
-                    fields.append(key)
                     if isinstance(value, V.Function):
                         methods[key] = value
+                    else:
+                        fields.append(key)
+            i += 1
     elif isinstance(prototype, V.Dictionary):
         for key, value in prototype.data.items():
             if isinstance(value, V.Function):
@@ -918,6 +949,22 @@ def _define(ev, args):
     ev.ctx.library.register_type(name, {"fields": fields, "methods": methods,
                                         "prototype": prototype})
     return V.Type(name)
+
+
+@impl("methods")
+def _methods(ev, args):
+    """Return method names attached to a user-defined object type."""
+    value = args[0]
+    if not isinstance(value, V.Object):
+        fail("methods expects an object", "Type Error")
+    names = []
+    if isinstance(value.proto, V.Type):
+        spec = ev.ctx.library.lookup_type(value.proto.data) or {}
+        names.extend(name for name, method in (spec.get("methods") or {}).items()
+                     if isinstance(method, V.Function))
+    names.extend(name for name, member in value.data.items()
+                 if isinstance(member, V.Function) and name not in names)
+    return V.Block([V.String(name) for name in names])
 
 
 @impl("is")
@@ -1119,6 +1166,13 @@ def _maybe_q(ev, args):
     return V.Logical(v.kind == "logical" and v.data == "maybe")
 
 
+@impl("set?")
+def _set_q(ev, args):
+    value = args[0]
+    name = value.data if isinstance(value, (V.Literal, V.String, V.Word)) else V.to_string(value)
+    return V.Logical(ev.ctx.has(name))
+
+
 @impl("defined?")
 def _defined(ev, args):
     a = args[0]
@@ -1259,13 +1313,19 @@ def _until(ev, args):
 @impl("do")
 def _do(ev, args):
     value = args[0]
+    times = attr(ev, "times", None)
+    count = 1
+    if times is not None:
+        if not isinstance(times, V.Integer):
+            fail("'times' attribute must be an integer", "Type Error")
+        count = max(0, times.data)
+
     if value.kind in ("string", "path"):
         text = V.to_string(value)
         import os
 
         if os.path.isfile(text) and not text.count("\n"):
             from ..parser import Parser
-            import io
 
             with open(text, encoding="utf-8", errors="replace") as fh:
                 source = fh.read()
@@ -1273,16 +1333,22 @@ def _do(ev, args):
             saved_standalone = ev.ctx.standalone
             ev.ctx.standalone = False
             try:
-                tree = Parser(source).parse()
-                ev.eval_node(ev._tree_for(V.Block(tree)))
+                block = V.Block(Parser(source).parse())
+                result = V.NULL
+                for _ in range(count):
+                    result = ev.do_block_unscoped(block)
+                return result
             finally:
                 ev.ctx.standalone = saved_standalone
                 ev.ctx.path.pop()
-            return V.NULL
         from ..parser import Parser
 
         value = V.Block(Parser(text).parse())
-    return ev.do_block_unscoped(value)
+
+    result = V.NULL
+    for _ in range(count):
+        result = ev.do_block_unscoped(value)
+    return result
 
 
 @impl("loop")
@@ -1449,21 +1515,35 @@ def _when(ev, args):
 # ---------------------------------------------------------------------------
 def make_function(ev, params_block, body_block, name="<closure>"):
     params: List[V.Value] = []
+    param_types: Dict[str, List[str]] = {}
+    current_param = None
     if isinstance(params_block, V.Literal):
         params = [V.Word(params_block.data)]
     elif isinstance(params_block, V.Block):
         for item in params_block.data:
             if isinstance(item, V.Type):
+                if current_param is not None:
+                    param_types.setdefault(current_param, []).append(item.data)
                 continue
             if isinstance(item, V.Label):
-                params.append(V.Word(item.data))
+                param = V.Word(item.data)
+            elif isinstance(item, (V.Word, V.Literal)):
+                param = item
+            else:
+                current_param = None
                 continue
-            params.append(item)
+            params.append(param)
+            current_param = param.data
     elif isinstance(params_block, V.Word):
         params = [params_block]
 
     fn = V.Function(name=name, params=params, body=body_block,
                     arity=len([p for p in params if not isinstance(p, V.Type)]))
+    fn.param_types = param_types
+    fn.doc = R.parse_user_doc_comments(body_block) if isinstance(body_block, V.Block) else {}
+    fn.doc["args"] = {p.data: param_types.get(p.data, ["any"])
+                       for p in params if isinstance(p, (V.Word, V.Literal))}
+    fn.attrs = {item["name"] for item in fn.doc.get("options", [])}
     fn.inline = attr_true(ev, "inline")
     exports = attr(ev, "export", None)
     if exports is not None:
@@ -1486,7 +1566,6 @@ def make_function(ev, params_block, body_block, name="<closure>"):
     if attr_true(ev, "pure"):
         fn.pure = True
     return fn
-
 
 @impl("function")
 def _function(ev, args):

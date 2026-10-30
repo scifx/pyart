@@ -6,6 +6,8 @@ from __future__ import annotations
 import datetime
 import hashlib
 import os
+import platform
+import socket
 import sys
 import time
 from typing import List
@@ -97,6 +99,40 @@ def _write(ev, args):
     except OSError as exc:
         raise ArturoError("File Error", str(exc))
     return V.NULL
+
+
+@impl("pause")
+def _pause(ev, args):
+    """Pause for Arturo's integer-millisecond or time-quantity duration."""
+    value = args[0]
+    if isinstance(value, V.Integer):
+        milliseconds = value.data
+    elif isinstance(value, V.Quantity):
+        unit = value.unit.strip().lower()
+        # Arturo quantities are dimensioned; accept time units only and convert
+        # the stored magnitude to the millisecond base used by `pause`.
+        factors = {
+            "ns": 1e-6, "nanosecond": 1e-6, "nanoseconds": 1e-6,
+            "us": 1e-3, "µs": 1e-3, "μs": 1e-3,
+            "ms": 1.0, "millisecond": 1.0, "milliseconds": 1.0,
+            "s": 1000.0, "sec": 1000.0, "second": 1000.0, "seconds": 1000.0,
+            "min": 60_000.0, "minute": 60_000.0, "minutes": 60_000.0,
+            "h": 3_600_000.0, "hr": 3_600_000.0, "hrs": 3_600_000.0,
+            "hour": 3_600_000.0, "hours": 3_600_000.0,
+            "day": 86_400_000.0, "days": 86_400_000.0,
+            "wk": 604_800_000.0, "week": 604_800_000.0, "weeks": 604_800_000.0,
+            "mo": 2_629_746_000.0, "month": 2_629_746_000.0,
+            "months": 2_629_746_000.0,
+            "yr": 31_556_952_000.0, "year": 31_556_952_000.0,
+            "years": 31_556_952_000.0,
+        }
+        if unit not in factors:
+            fail(f"cannot use {unit!r} as a time duration", "Type Error")
+        milliseconds = to_number(value.value) * factors[unit]
+    else:
+        fail("pause expects an integer or time quantity", "Type Error")
+    time.sleep(max(0.0, float(milliseconds)) / 1000.0)
+    return V.VOID
 
 
 @builtin("exists?", arity=1)
@@ -216,9 +252,76 @@ def _script(ev, args):
     return V.String(ev.ctx.path[0] if ev.ctx.path else "")
 
 
+@builtin("arg", arity=0)
+def _arg(ev, args):
+    """Return the raw command-line arguments as a block of strings."""
+    return V.Block([V.String(str(a)) for a in getattr(ev.ctx, "argv", [])])
+
+
 @builtin("args", arity=0)
 def _args(ev, args):
-    return V.Block([V.String(a) for a in getattr(ev.ctx, "argv", [])])
+    """Parse positional values and command-line switches into a dictionary."""
+    argv = [str(item) for item in getattr(ev.ctx, "argv", [])]
+    result = {}
+    positional = []
+    i = 0
+    while i < len(argv):
+        item = argv[i]
+        if item.startswith("-") and item != "-" and not item[1:2].isdigit():
+            option = item.lstrip("-")
+            if ":" in option:
+                key, raw = option.split(":", 1)
+                result[key] = _parse_arg_value(raw)
+            else:
+                key = option
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    i += 1
+                    result[key] = _parse_arg_value(argv[i])
+                else:
+                    result[key] = V.TRUE
+        else:
+            positional.append(_parse_arg_value(item))
+        i += 1
+    if positional:
+        result["values"] = V.Block(positional)
+    elif any(key not in ("values",) for key in result):
+        result["values"] = V.Block([])
+    return V.Dictionary(result)
+
+
+def _parse_arg_value(text: str) -> V.Value:
+    try:
+        return V.Integer(int(text))
+    except ValueError:
+        try:
+            return V.Floating(float(text))
+        except ValueError:
+            return V.String(text)
+
+
+@builtin("sys", arity=0)
+def _sys(ev, args):
+    """Return Python-host system information using Arturo's field names."""
+    system = platform.system().lower()
+    os_name = {"darwin": "macos", "windows": "windows"}.get(system, system)
+    built = V.Date(datetime.datetime.now().astimezone())
+    return V.Dictionary({
+        "author": V.String("Pyart contributors"),
+        "copyright": V.String("(c) 2026 Pyart contributors"),
+        "version": V.Version("0.10.1-dev+pyart"),
+        "codename": V.String("Pyart"),
+        "built": built,
+        "deps": V.Dictionary({}),
+        "binary": V.String(sys.executable),
+        "cpu": V.Dictionary({
+            "arch": V.Literal(platform.machine() or "unknown"),
+            "endian": V.Literal(sys.byteorder),
+            "cores": V.Integer(os.cpu_count() or 1),
+        }),
+        "os": V.Literal(os_name),
+        "hostname": V.String(socket.gethostname()),
+        "release": V.Literal("python"),
+    })
 
 
 @builtin("standalone?", arity=0)

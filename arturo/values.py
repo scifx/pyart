@@ -287,6 +287,9 @@ class Block(Value):
     def __init__(self, data=None):
         self.data: List[Value] = list(data) if data is not None else []
         self.frozen = False
+        # `;;` data comments are attached by the parser to function bodies;
+        # they are documentation, not executable tokens.
+        self.doc_comments: List[str] = []
 
     def __len__(self):
         return len(self.data)

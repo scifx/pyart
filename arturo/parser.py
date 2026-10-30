@@ -231,17 +231,23 @@ class Parser:
         return block
 
     # -- whitespace / comments -------------------------------------------
-    def _skip(self) -> None:
+    def _skip(self, block: Optional[V.Block] = None) -> None:
         while True:
             ch = self._ch()
             if ch in (" ", "\t", "\r", "\n"):
                 self._adv()
             elif ch == ";":
-                # `;; ...` on its own is a doc string - skip the whole line(s)
-                if self._ch(1) == ";":
+                # A double-semicolon line is Arturo's data-comment syntax. Keep
+                # it on the containing block for function reflection, while
+                # excluding it from executable block values.
+                is_doc = self._ch(1) == ";"
+                if is_doc:
                     self._adv(2)
+                    start = self.pos
                     while not self._at_end() and self._ch() != "\n":
                         self._adv()
+                    if block is not None:
+                        block.doc_comments.append(self.src[start:self.pos].strip())
                 else:
                     while not self._at_end() and self._ch() != "\n":
                         self._adv()
@@ -257,7 +263,7 @@ class Parser:
         cls = V.Inline if is_sub_inline else V.Block
         block = cls()
         while True:
-            self._skip()
+            self._skip(block)
             if self._at_end():
                 if level != 0:
                     if is_sub_block:
@@ -549,6 +555,12 @@ class Parser:
                 while self._ch() in PERMITTED_QTY:
                     self._adv()
                 return V.Quantity(V.Floating(float(text)), self.src[unit_start:self.pos])
+            if self._ch() == ":" and self._ch(1) in LETTERS:
+                self._adv()
+                unit_start = self.pos
+                while self._ch() in PERMITTED_QTY:
+                    self._adv()
+                return V.Quantity(V.Floating(float(text)), self.src[unit_start:self.pos])
             if self._ch() in ("e", "E") and (self._ch(1) in DIGITS or self._ch(1) in "+-"):
                 self._adv()
                 exp_start = self.pos
@@ -565,6 +577,15 @@ class Parser:
             while self._ch() in PERMITTED_QTY:
                 self._adv()
             return V.Quantity(V.Integer(int(text)), self.src[unit_start:self.pos])
+        if self._ch() == ":" and self._ch(1) in LETTERS:
+            # Arturo's documented unit notation is `2:s` (alongside the
+            # backtick form `2`s`). Keep `1:2` on the rational path below.
+            self._adv()
+            unit_start = self.pos
+            while self._ch() in PERMITTED_QTY:
+                self._adv()
+            return V.Quantity(V.Integer(int(text)), self.src[unit_start:self.pos])
+
         if self._ch() == ":" and self._ch(1) in DIGITS:
             self._adv()
             den_start = self.pos

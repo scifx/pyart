@@ -237,6 +237,43 @@ _TYPE_ORDER = {
 }
 
 
+def _compare_versions(left: str, right: str) -> int:
+    """Compare dotted versions numerically, including pre-release suffixes."""
+    import re
+
+    def split(text):
+        main, _, build = text.partition("+")
+        core, dash, prerelease = main.partition("-")
+        nums = tuple(int(part) if part.isdigit() else part
+                     for part in re.findall(r"\d+|[A-Za-z]+", core))
+        pre = tuple(int(part) if part.isdigit() else part.lower()
+                    for part in re.findall(r"\d+|[A-Za-z]+", prerelease)) if dash else None
+        return nums, pre
+
+    a, apre = split(left)
+    b, bpre = split(right)
+    length = max(len(a), len(b))
+    a = a + (0,) * (length - len(a))
+    b = b + (0,) * (length - len(b))
+    for x, y in zip(a, b):
+        if x == y:
+            continue
+        if isinstance(x, int) and isinstance(y, int):
+            return (x > y) - (x < y)
+        return (str(x) > str(y)) - (str(x) < str(y))
+    if apre is None or bpre is None:
+        return 0 if apre is bpre else (1 if apre is None else -1)
+    for x, y in zip(apre, bpre):
+        if x == y:
+            continue
+        if isinstance(x, int) and isinstance(y, str):
+            return -1
+        if isinstance(x, str) and isinstance(y, int):
+            return 1
+        return (x > y) - (x < y)
+    return (len(apre) > len(bpre)) - (len(apre) < len(bpre))
+
+
 def compare(a: V.Value, b: V.Value, sensitive: bool = True) -> int:
     """Arturo's total ordering, used by ``<``/``>``/``sort``."""
     if is_num(a) and is_num(b):
@@ -272,7 +309,7 @@ def compare(a: V.Value, b: V.Value, sensitive: bool = True) -> int:
     if k == "date":
         return (a.data > b.data) - (a.data < b.data)
     if k == "version":
-        return (a.data > b.data) - (a.data < b.data)
+        return _compare_versions(a.data, b.data)
     return 0
 
 

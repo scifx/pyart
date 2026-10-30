@@ -339,6 +339,17 @@ class Evaluator:
                 "Value Error",
                 f"Not enough parameters\nCannot perform: {name}",
             )
+        param_types = getattr(fn, "param_types", {})
+        for param, arg in zip(fn.params, args):
+            pname = param_name(param)
+            expected = param_types.get(pname, ())
+            if not expected or "any" in expected:
+                continue
+            actual = arg.kind
+            if isinstance(arg, V.Object) and isinstance(arg.proto, V.Type):
+                actual = arg.proto.data
+            if not any(actual == t for t in expected):
+                raise ArturoError("Assertion Failed", "Assertion failed")
         if fn.memoize:
             key = tuple(V.value_key(a) for a in args)
             if not hasattr(fn, "_memo"):
