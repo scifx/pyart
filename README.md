@@ -16,11 +16,28 @@ Hello world!
 
 | | |
 | --- | --- |
-| Example benchmark | **337 / 338 (99.7 %)** of the examples the reference runtime passes |
-| Language tests | **85 / 85** (`tests/test_language.py`, every check cross-checked with the reference binary) |
-| Builtin library | **334 implemented** of 551 registered names (217 still stubs, see [`docs/BUILTIN_STATUS.md`](docs/BUILTIN_STATUS.md)) |
+| Example benchmark | **338 / 338 (100 %)** of the examples the reference runtime passes (`--jobs 2 --timeout 60`) |
+| Language tests | **101 / 101** (`tests/test_language.py`; current additions are covered by local regression checks) |
+| Builtin library | **340 implemented** of 551 registered names (211 still stubs, see [`docs/BUILTIN_STATUS.md`](docs/BUILTIN_STATUS.md)) |
 | Code size | ~9.3k lines of Python |
 | Main remaining blocker | interpreter **speed** (a few compute-heavy examples need 20–50 s) |
+
+---
+
+## Current progress (2026-10-30)
+
+Current work restores source-backed `info` metadata, typed user-function parameters and
+`;;` documentation, and implements `pause` and `methods`; it also fixes `do.times` and
+Arturo's documented colon-form quantity literals (`2:s`). The local language suite is
+**101/101**, and the latest reference-pass benchmark is **338/338 (100%)** with a
+60-second per-example timeout. The inventory is **340 implemented / 211 pending**. Stage details and known gaps are tracked in [`docs/PROGRESS.md`](docs/PROGRESS.md).
+
+`info.get` is backed by a checked-in metadata snapshot extracted from Arturo-Future
+source: argument and attribute types, descriptions, return types, examples, module,
+source line, and source URL. User-defined functions also retain `;;` data comments and
+typed parameters for reflection; typed arguments are checked at call time. `pause`
+accepts integer milliseconds and time quantities. The documented `arg`, `sys`, and
+`set?` helpers are also implemented.
 
 ---
 
@@ -60,12 +77,14 @@ arguments (`args`, `script`).
 | `arturo/evaluator.py` | `src/vm/eval.nim`, `exec.nim` | tree-walking evaluator, scopes/frames, attribute stack, signals (`break`/`continue`/`return`/`ensure`), collectors, error values |
 | `arturo/values.py` | `src/vm/values/*` | value hierarchy (integer, floating, rational, complex, logical, quantity, char, string, block, inline, dictionary, object, range, date, binary, function, iterator, …), printing/formatting, comparison |
 | `arturo/library.py` | `src/vm/lib.nim` | symbol table shared by parser, AST builder and evaluator |
-| `arturo/signatures.py` | `src/library/*.nim` | **523** declared arities + accepted attributes (drives parsing of every call) |
+| `arturo/reflection.py` + `arturo/builtin_docs.json` | `helpers/helper.nim`, `src/library/*.nim` | source-backed `info` metadata, examples, and user-function data comments |
+| `arturo/signatures.py` | `src/library/*.nim` | **551** declared arities + accepted attributes (drives parsing of every call) |
 | `arturo/builtins/*.py` | `src/library/*.nim` | the standard library: `core`, `collections`, `strings`, `iterators`, `numbers`, `misc`, `dates` |
 | `arturo/nimtime.py` | `std/times` | date pattern handling (`yyyy-MM-dd`, `dddd`, …) |
 | `arturo/cli.py`, `repl.py` | `src/arturo.nim` | command line entry point and REPL |
 | `tools/inventory.py` | — | regenerates the implemented/stub inventory in `docs/` |
-| `tests/test_language.py` | — | 85 language-level checks |
+| `tools/build_builtin_metadata.py` | pinned Arturo-Future source | builds the checked-in source metadata snapshot |
+| `tests/test_language.py` | — | 101 language-level checks |
 | `benchmarks/` | — | harness that runs the upstream examples and diffs their output |
 
 ### Language semantics that are implemented 1:1
@@ -84,6 +103,7 @@ arguments (`args`, `script`).
 * **In-place updates via literals** — `'xs ++ 4`, `inc 'i`, `sort 'xs`, `d\key: v`.
 * **`=>` injects implicit parameters** (`&`, `__`) into a block; `->` wraps the next
   statement as a single-value block.
+* `do.times: n [block]` executes a block n times; `do` without `.times` executes once.
 * `if`/`if?`/`else`, `when`/`when?`, `switch`/`switch?`, `case`, `unless`/`unless?`,
   `while`, `until`, `try`/`throw`/`panic`/`ensure`, `loop`/`map`/`select`/`filter`/
   `fold`/`collect`/`arrange`, `return`/`break`/`continue`.
@@ -103,31 +123,29 @@ $ python3 benchmarks/one.py "100 doors"                      # debug one example
 $ python3 benchmarks/run_examples.py --show-fail 30          # + worst offenders
 ```
 
-Current result of a full run (`--jobs 2 --timeout 60`, `/tmp/b23.json`):
+Latest full run after the current implementation (`--jobs 2 --timeout 60`,
+2026-10-30):
 
 ```
-passed 337/338 examples (99.7%)
-plus 42 examples the reference runtime itself cannot run
+passed 338/338 examples (100%)
+plus 44 examples the reference runtime itself cannot run
 ```
 
-The single failure is `rosetta/perfect numbers.art`: it takes ~41 s standalone and runs
-past the 60 s timeout when two examples share the two CPUs. With the harness default
-`--timeout 20` these compute-heavy examples also go over budget (all of them pass at
-60 s):
+All reference-passing examples completed within the 60-second limit. The slowest were:
 
 | example | time |
 | --- | ---: |
-| `perfect numbers` | > 60 s (41 s standalone) |
-| `curzon numbers` | 50 s |
-| `permutations - derangements` | 36 s |
-| `changeable words` | 35 s |
-| `abundant odd numbers` | 22 s |
-| `truncatable primes` | 20 s |
-| `circular primes` | 14 s |
-| `ascending primes` | 12 s |
+| `perfect numbers` | 32.7 s |
+| `curzon numbers` | 28.5 s |
+| `permutations - derangements` | 18.6 s |
+| `changeable words` | 17.8 s |
+| `abundant odd numbers` | 11.6 s |
+| `truncatable primes` | 10.1 s |
+| `circular primes` | 6.8 s |
+| `ascending primes` | 6.1 s |
 
-Everything else finishes in well under 10 s. The gap is pure interpreter speed, not
-correctness — see the roadmap below.
+The default harness timeout is 20 seconds, so use `--timeout 60` for the full reference
+set on a constrained machine.
 
 ---
 
@@ -140,30 +158,30 @@ of silently producing wrong results.
 
 | module | implemented |
 | --- | ---: |
-| `core.py` — control flow, logic, conversion, reflection, bitwise | 128 |
+| `core.py` — control flow, logic, conversion, reflection, bitwise | 131 |
 | `numbers.py` — arithmetic, primes, clamps, statistics, random | 58 |
 | `collections.py` — blocks, dictionaries, sets, sorting, paths | 52 |
 | `strings.py` — splitting, padding, formatting, regex, encoding | 32 |
-| `misc.py` — files, paths, JSON, IO, crypto digests, system info | 30 |
+| `misc.py` — files, paths, JSON, IO, crypto digests, system info | 33 |
 | `iterators.py` — `loop`/`map`/`select`/`filter`/`fold`/`combine`/… | 23 |
 | `dates.py` — `now`, `today`, date arithmetic and predicates | 11 |
-| *(declared only — stubs)* | 217 |
+| *(declared only — stubs)* | 211 |
 
 **Full list**: [`docs/BUILTIN_STATUS.md`](docs/BUILTIN_STATUS.md) (regenerate with
 `python3 tools/inventory.py --markdown > docs/BUILTIN_STATUS.md`).
 
-### What is *not* implemented yet (217 names)
+### What is *not* implemented yet (211 names)
 
 * **Quantity-type predicates (60)** — `length?`, `mass?`, `area?`, `pressure?`,
   `temperature?`, … These only need a unit-family table, so they are cheap to add.
 * **Translated aliases (42)** — the Chinese keyword set (`如果`, `循环`, `打印`, `映射`,
   `筛选`, …). Pure aliasing of builtins that already exist.
-* **Everything else (115)** — three groups worth distinguishing:
-  * *cheap reflection / small helpers*: `info`, `methods`, `arg`, `eval`, `parse`,
-    `hash`, `in`, `units`, `sortable`, `conforms?`, `with`, `set?`, `iterator`,
+* **Everything else (109)** — three groups worth distinguishing:
+  * *cheap reflection / small helpers*: `eval`, `parse`,
+    `hash`, `in`, `units`, `sortable`, `conforms?`, `with`, `iterator`,
     `entropy?`, `errorKind?`, `hidden?`, `superuser?`.
   * *OS / filesystem*: `cd`, `execute`, `process`, `permissions`, `rename`, `symlink`,
-    `terminal`, `pause`, `wait`, `open`/`close`/`seek`/`tell`/`rewind`.
+    `terminal`, `wait`, `open`/`close`/`seek`/`tell`/`rewind`.
   * *system-level subsystems* (largest effort): `net` (`serve`, `request`, `download`,
     `mail`, `socket?`), `ui` (`webview`, `dialog`, `popup`, `alert`, colour helpers),
     `db` (`database?`, `query`), tasks/fibers (`yield`, `channel`, `terminate`,
@@ -216,7 +234,7 @@ def _clamp(ev, args):
 ## Development workflow
 
 ```console
-$ python3 tests/test_language.py              # 85 language checks (fast)
+$ python3 tests/test_language.py              # 101 language checks (fast)
 $ python3 benchmarks/one.py "bead sort"       # run one example + diff with the .res
 $ python3 tools/inventory.py                  # builtin coverage report
 $ python3 tools/difftest.py --reference /path/to/arturo   # differential smoke test
@@ -265,14 +283,16 @@ accepts more than the reference, 22 are rejected by both, 3 genuinely differ**:
 
 ## Roadmap (highest value first)
 
-1. **Speed**: compile single-statement loop bodies (`select`/`map`/`loop`) into integer
+1. **Benchmark parity**: run the reference-pass example corpus after semantic changes; fix
+   mismatches and keep performance-sensitive examples inside the harness timeout.
+2. **Speed**: compile single-statement loop bodies (`select`/`map`/`loop`) into integer
    expressions — target ~0.3 µs/iteration, which puts every example comfortably under
    the 20 s budget.
-2. **Cheap builtins**: the 60 quantity predicates and the 42 translated aliases (both
-   mechanical), plus the remaining small helpers (`info`, `methods`, `arg`, `eval`,
-   `parse`, `hash`, `in`, `units`, `conforms?`, `set?`, …).
-3. **Semantic polish**: multi-line `->` capture (needs newline-aware parsing),
+3. **Cheap builtins**: the 60 quantity predicates and the 42 translated aliases (both
+   mechanical), plus the remaining small helpers (`eval`,
+   `parse`, `hash`, `in`, `units`, `conforms?`, …).
+4. **Semantic polish**: multi-line `->` capture (needs newline-aware parsing),
    `date - date` → `:duration`, `truncate`/`sample.size` edge cases. Also the
    `same?`/`type` corners.
-4. **Subsystems**: filesystem mutation (`rename`, `symlink`, `permissions`), process
+5. **Subsystems**: filesystem mutation (`rename`, `symlink`, `permissions`), process
    execution, sockets/HTTP, sqlite, tasks/fibers, UI.
