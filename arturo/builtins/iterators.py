@@ -504,15 +504,23 @@ def _enumerate(ev, args):
 
 @impl("combine")
 def _combine(ev, args):
-    a, b = args[0], args[1]
-    left = seq_of(a) if a.kind not in ("block", "inline") else list(a.data)
-    right = seq_of(b) if b.kind not in ("block", "inline") else list(b.data)
-    out = []
-    for i in range(max(len(left), len(right))):
-        x = left[i] if i < len(left) else V.NULL
-        y = right[i] if i < len(right) else V.NULL
-        out.append(V.Block([x, y]))
-    return V.Block(out)
+    """All combinations of the given block (``.by`` / ``.repeated``)."""
+    import itertools
+
+    collection = args[0]
+    items = (list(collection.data) if collection.kind in ("block", "inline")
+             else seq_of(collection))
+    by = attr(ev, "by", None)
+    size = to_int(by) if by is not None else len(items)
+    if size < 0:
+        size = 0
+    if attr_true(ev, "repeated"):
+        combos = list(itertools.combinations_with_replacement(items, size))
+    else:
+        combos = list(itertools.combinations(items, size))
+    if attr_true(ev, "count"):
+        return V.Integer(len(combos))
+    return V.Block([V.Block(list(c)) for c in combos])
 
 
 @impl("couple")
@@ -525,10 +533,15 @@ def _couple(ev, args):
 
 @impl("decouple")
 def _decouple(ev, args):
+    """Transpose a block of blocks: ``[[1 2] [3 4]]`` => ``[[1 3] [2 4]]``."""
     block = args[0]
-    if not isinstance(block, V.Block) or len(block.data) < 2:
+    if not isinstance(block, V.Block):
         return V.Block([block])
-    return V.Block([block.data[0], block.data[1]])
+    rows = [list(r.data) if isinstance(r, V.Block) else [r] for r in block.data]
+    if not rows:
+        return V.Block([])
+    width = min(len(rows), min(len(r) for r in rows))
+    return V.Block([V.Block([r[i] for r in rows]) for i in range(width)])
 
 
 # ---------------------------------------------------------------------------

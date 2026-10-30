@@ -437,7 +437,44 @@ def _escape(ev, args):
         text = V.to_string(args[0])
         return V.String("".join(_XML_ESCAPES.get(ch, ch) for ch in text))
     text = _str(args[0])
-    return V.String(text.encode("unicode_escape").decode("ascii"))
+    out = ['"']
+    for ch in text:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif 32 <= ord(ch) < 127:
+            out.append(ch)
+        elif ch == "\n":
+            out.append("\\x0A")
+        elif ch == "\t":
+            out.append("\\x09")
+        elif ch == "\r":
+            out.append("\\x0D")
+        elif ord(ch) < 256:
+            out.append("\\x%02X" % ord(ch))
+        else:
+            out.append("\\u%04X" % ord(ch))
+    out.append('"')
+    return V.String("".join(out))
+
+
+@builtin("lower?", arity=1)
+def _lower_q(ev, args):
+    value = args[0]
+    if value.kind == "char":
+        return V.Logical(value.data.islower())
+    text = _str(value)
+    return V.Logical(bool(text) and all(not c.isupper() for c in text))
+
+
+@builtin("upper?", arity=1)
+def _upper_q(ev, args):
+    value = args[0]
+    if value.kind == "char":
+        return V.Logical(value.data.isupper())
+    text = _str(value)
+    return V.Logical(bool(text) and all(not c.islower() for c in text))
 
 
 @builtin("unescape", arity=1)

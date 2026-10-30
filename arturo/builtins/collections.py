@@ -964,8 +964,21 @@ def _pop(ev, args):
 
 @builtin("path", arity=1)
 def _path(ev, args):
+    """``path`` (bare) => the current/home/temp dictionary.
+
+    With an argument it returns the file-info dictionary instead (a
+    convenience the reference implementation offers through ``.file``).
+    """
+    import os
     from pathlib import Path as _Path
 
+    if not args:
+        home = os.path.expanduser("~")
+        return V.Dictionary({
+            "current": V.String(os.getcwd() + os.sep),
+            "home": V.String(home + os.sep),
+            "temp": V.String(os.path.join(os.sep, "tmp") + os.sep),
+        })
     value = args[0]
     text = V.to_string(value)
     p = _Path(text)

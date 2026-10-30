@@ -53,10 +53,7 @@ def _sqrt(ev, args):
     value = args[0]
     if value.kind == "quantity":
         return V.Quantity(_wrap(math.sqrt(_num(value.value))), value.unit)
-    x = _num(value)
-    result = math.sqrt(x)
-    if isinstance(x, int) and result == int(result):
-        return V.Integer(int(result))
+    result = math.sqrt(_num(value))
     return V.Floating(result)
 
 
@@ -94,10 +91,8 @@ def _round(ev, args):
     to = attr(ev, "to", None)
     x = _num(value)
     if to is not None:
-        ndigits = to_int(to)
-        result = round(x, ndigits)
-        return V.Floating(float(result)) if ndigits > 0 else V.Integer(int(result))
-    return V.Integer(int(round(x)))
+        return V.Floating(float(round(x, to_int(to))))
+    return V.Floating(float(round(x)))
 
 
 @impl("powmod")
@@ -222,6 +217,39 @@ def _is_prime(n: int) -> bool:
 @impl("prime?")
 def _prime_q(ev, args):
     return V.Logical(_is_prime(to_int(args[0])))
+
+
+@impl("clamp")
+def _clamp(ev, args):
+    value, bounds = args[0], args[1]
+    if bounds.kind == "range":
+        start, stop, step = bounds.data
+        lo, hi = (start, stop) if (step or 1) >= 0 else (stop, start)
+    elif bounds.kind in ("block", "inline") and len(bounds.data) >= 2:
+        lo, hi = bounds.data[0], bounds.data[1]
+    else:
+        fail(f"cannot clamp using {bounds.kind}", "Type Error")
+    def _wrap(x):
+        if isinstance(x, V.Value):
+            return x
+        return V.Integer(x) if isinstance(x, int) else V.Floating(float(x))
+
+    lo, hi = _wrap(lo), _wrap(hi)
+    lo_v, hi_v = to_number(lo), to_number(hi)
+    val = to_number(value)
+    if val < lo_v:
+        return lo
+    if val > hi_v:
+        return hi
+    return value
+
+
+@impl("conj")
+def _conj(ev, args):
+    value = args[0]
+    if value.kind != "complex":
+        fail(f"cannot get conjugate of {value.kind}", "Type Error")
+    return V.Complex(complex(value.data.real, -value.data.imag))
 
 
 @impl("digits")

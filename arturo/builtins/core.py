@@ -319,7 +319,12 @@ def _not_equal(ev, args):
 @impl("same?")
 def _same(ev, args):
     a, b = args
-    return V.Logical(a is b or V.same_value(a, b))
+    # ``same?`` is stricter than ``=``: ``same? 1 1.0`` is false
+    if a is b:
+        return V.Logical(True)
+    if a.kind != b.kind and not {a.kind, b.kind} <= {"block", "inline"}:
+        return V.Logical(False)
+    return V.Logical(V.same_value(a, b))
 
 
 @impl("less?")
@@ -494,20 +499,42 @@ def _prints(ev, args):
     return _print_common(ev, args[0], newline=False)
 
 
+@builtin("arity", arity=0)
+def _arity_table(ev, args):
+    """``arity`` => dictionary mapping every known name to its arity."""
+    lib = ev.ctx.library
+    out = {}
+    for name in lib.names():
+        fn = lib.lookup(name)
+        if fn is not None:
+            out[name] = V.Integer(getattr(fn, "arity", -1))
+    return V.Dictionary(out)
+
+
+@impl("nor?")
+def _nor_q(ev, args):
+    return V.Logical(not (V.is_true(args[0]) or V.is_true(args[1])))
+
+
+@impl("xnor?")
+def _xnor_q(ev, args):
+    return V.Logical(V.is_true(args[0]) == V.is_true(args[1]))
+
+
 @builtin("inspect", arity=1, attrs=["muted", "compact", "index"])
 def _inspect(ev, args):
-    write_out(ev, _inspect_str(args[0]) + "\n")
-    return VOID
+    return V.String(_inspect_str(args[0]))
 
 
 def _inspect_str(value: V.Value, level: int = 0) -> str:
-    pad = "   " * level
+    pad = "    " * level
     k = value.kind
     if k == "block":
         if not value.data:
-            return "[]"
-        inner = "\n".join(_inspect_str(v, level + 1) for v in value.data)
-        return "[\n" + inner + "\n" + pad + "]"
+            return "[] :block"
+        inner = "\n".join(pad + "    " + _inspect_str(v, level + 1)
+                           for v in value.data)
+        return "[ :block\n" + inner + "\n" + pad + "]"
     if k == "dictionary":
         if not value.data:
             return "#[]"
@@ -638,8 +665,9 @@ def _convert_one(ev, name: str, value: V.Value) -> V.Value:
                 return V.String(pattern % number)
             except (ValueError, TypeError):
                 pass
-        if value.kind == "block":
-            return V.String(" ".join(V.block_item_str(x) for x in value.data))
+        if value.kind in ("block", "inline"):
+            # ``to :string [1 2 3]`` keeps the brackets ("[1 2 3]")
+            return V.String(V.block_item_str(value))
         return V.String(V.to_string(value))
     if name == "integer":
         if value.kind == "string":

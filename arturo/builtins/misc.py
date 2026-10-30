@@ -239,6 +239,24 @@ def _system(ev, args):
 # ---------------------------------------------------------------------------
 # Crypto / hashing
 # ---------------------------------------------------------------------------
+@builtin("absolute", arity=1)
+def _absolute_path(ev, args):
+    import os
+
+    text = V.to_string(args[0])
+    if os.path.isabs(text):
+        return V.String(os.path.normpath(text))
+    base = os.path.dirname(os.path.abspath(ev.ctx.path[-1])) if ev.ctx.path else os.getcwd()
+    return V.String(os.path.normpath(os.path.join(base, text)))
+
+
+@builtin("absolute?", arity=1)
+def _absolute_q(ev, args):
+    import os
+
+    return V.Logical(os.path.isabs(V.to_string(args[0])))
+
+
 @builtin("digest", arity=1, attrs=["sha", "sha1", "sha256", "sha512", "md5"])
 def _digest(ev, args):
     value = args[0]
