@@ -130,23 +130,31 @@ def _factorial(ev, args):
     return V.Integer(math.factorial(n))
 
 
-@impl("factors")
+@builtin("factors", arity=1, attrs=["prime"])
 def _factors(ev, args):
-    """Prime factorisation (with repetitions), e.g. ``factors 12`` => 2 2 3."""
-    value = args[0]
-    n = abs(to_int(value))
-    result = []
-    d = 2
-    while d * d <= n:
-        while n % d == 0:
-            result.append(V.Integer(d))
-            n //= d
-        d += 1 if d == 2 else 2
-    if n > 1:
-        result.append(V.Integer(n))
-    if value.kind == "floating" or (isinstance(value, V.Integer) and False):
-        pass
-    return V.Block(result)
+    """``factors`` - all divisors; ``factors.prime`` - prime factorisation."""
+    n = abs(to_int(args[0]))
+    if attr_true(ev, "prime"):
+        out = []
+        d = 2
+        while d * d <= n:
+            while n % d == 0:
+                out.append(V.Integer(d))
+                n //= d
+            d += 1 if d == 2 else 2
+        if n > 1:
+            out.append(V.Integer(n))
+        return V.Block(out)
+    out = []
+    i = 1
+    while i * i <= n:
+        if n % i == 0:
+            out.append(V.Integer(i))
+            if i != n // i:
+                out.append(V.Integer(n // i))
+        i += 1
+    return V.Block(sorted(out, key=lambda v: v.data))
+
 
 
 @impl("divisors")

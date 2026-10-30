@@ -757,28 +757,45 @@ def _permutate(ev, args):
     return V.Block([V.Block(list(c)) for c in combos])
 
 
-@impl("take")
+def _take_text(collection, chunk):
+    if collection.kind == "string":
+        return V.String("".join(V.to_string(x) for x in chunk))
+    if collection.kind in ("block", "inline"):
+        return V.Block(list(chunk))
+    return V.Block(list(chunk))
+
+
+@builtin("take", arity=2, attrs=["last", "times"])
 def _take(ev, args):
-    collection, count = args[0], args[1]
+    collection = args[0]
+    value, setter = inplace(ev, collection)
+    times = attr(ev, "times", None)
+    n = to_int(args[1]) if len(args) > 1 else (to_int(times) if times is not None else 1)
     last = attr_true(ev, "last")
-    items = _items_of(ev, collection)
-    n = to_int(count)
+    items = _items_of(ev, value)
     chunk = items[-n:] if last else items[:n]
-    if collection.kind == "string":
-        return V.String("".join(V.to_string(x) for x in chunk))
-    return V.Block(chunk)
+    result = _take_text(value, chunk)
+    if setter:
+        setter(result)
+    return result
 
 
-@impl("drop")
+@builtin("drop", arity=1, attrs=["last", "times"])
 def _drop(ev, args):
-    collection, count = args[0], args[1]
+    collection = args[0]
+    value, setter = inplace(ev, collection)
+    times = attr(ev, "times", None)
+    n = to_int(times) if times is not None else 1
     last = attr_true(ev, "last")
-    items = _items_of(ev, collection)
-    n = to_int(count)
-    chunk = items[:-n] if last else items[n:]
-    if collection.kind == "string":
-        return V.String("".join(V.to_string(x) for x in chunk))
-    return V.Block(chunk)
+    items = _items_of(ev, value)
+    if n < 0:
+        chunk = items[:n] if not last else items[:len(items) + n]
+    else:
+        chunk = items[:-n] if last else items[n:]
+    result = _take_text(value, chunk)
+    if setter:
+        setter(result)
+    return result
 
 
 @impl("chop")
