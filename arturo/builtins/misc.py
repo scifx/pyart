@@ -8,8 +8,10 @@ import hashlib
 import os
 import platform
 import socket
+import subprocess
 import sys
 import time
+import shlex
 from typing import List
 
 from .. import values as V
@@ -260,36 +262,43 @@ def _arg(ev, args):
 
 @builtin("args", arity=0)
 def _args(ev, args):
-    """Parse positional values and command-line switches into a dictionary."""
+    """Return parsed switches plus the always-present positional `values` block."""
     argv = [str(item) for item in getattr(ev.ctx, "argv", [])]
     result = {}
     positional = []
-    i = 0
-    while i < len(argv):
-        item = argv[i]
-        if item.startswith("-") and item != "-" and not item[1:2].isdigit():
-            option = item.lstrip("-")
-            if ":" in option:
-                key, raw = option.split(":", 1)
+    parse_options = True
+    for item in argv:
+        if parse_options and item == "--":
+            parse_options = False
+            continue
+        if parse_options and item.startswith("--") and len(item) > 2:
+            option = item[2:]
+            separator = next((i for i, c in enumerate(option) if c in ":="), -1)
+            if separator >= 0:
+                key, raw = option[:separator], option[separator + 1:]
                 result[key] = _parse_arg_value(raw)
             else:
-                key = option
-                if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                    i += 1
-                    result[key] = _parse_arg_value(argv[i])
-                else:
-                    result[key] = V.TRUE
+                result[option] = V.TRUE
+        elif parse_options and item.startswith("-") and item != "-" and not item[1:2].isdigit():
+            option = item[1:]
+            separator = next((i for i, c in enumerate(option) if c in ":="), -1)
+            if separator >= 0:
+                key, raw = option[:separator], option[separator + 1:]
+                result[key] = _parse_arg_value(raw)
+            else:
+                result[option] = V.TRUE
         else:
             positional.append(_parse_arg_value(item))
-        i += 1
-    if positional:
-        result["values"] = V.Block(positional)
-    elif any(key not in ("values",) for key in result):
-        result["values"] = V.Block([])
+    result["values"] = V.Block(positional)
     return V.Dictionary(result)
 
 
 def _parse_arg_value(text: str) -> V.Value:
+    lowered = text.lower()
+    if text == "" or lowered in ("true", "on"):
+        return V.TRUE
+    if lowered in ("false", "off"):
+        return V.FALSE
     try:
         return V.Integer(int(text))
     except ValueError:
@@ -336,7 +345,91 @@ def _exit(ev, args):
 
 @builtin("system", arity=0)
 def _system(ev, args):
-    return V.Dictionary({"os": V.String(sys.platform), "arch": V.String("amd64")})
+    return V.Dictionary({"os": V.String(sys.platform), "arch": V.String(platform.machine() or "unknown")})
+
+
+@builtin("execute", arity=1, attrs=["args", "async", "code", "directly"])
+def _execute(ev, args):
+    """Run an OS command; preserve Arturo's output/code/direct modes."""
+    command = V.to_string(args[0])
+    raw_args = attr(ev, "args", None)
+    async_attr = attr(ev, "async", None)
+    code_mode = attr(ev, "code", None) is not None
+    directly = attr(ev, "directly", None) is not None
+    if raw_args is not None:
+        if not isinstance(raw_args, V.Block):
+            fail("execute.args expects a block of strings", "Type Error")
+        command += " " + " ".join(shlex.quote(V.to_string(v)) for v in raw_args.data)
+    if async_attr is not None:
+        fail("execute.async requires the task runtime, which is not implemented", "Not Implemented")
+    try:
+        if directly:
+            completed = subprocess.run(command, shell=True, check=False)
+            return V.Integer(completed.returncode) if code_mode else VOID
+        completed = subprocess.run(
+            command, shell=True, check=False, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, errors="replace",
+        )
+    except OSError as exc:
+        fail(str(exc), "System Error")
+    output = completed.stdout or ""
+    if code_mode:
+        return V.Dictionary({"output": V.String(output), "code": V.Integer(completed.returncode)})
+    return V.String(output)
+
+
+@builtin("process", arity=0)
+def _process_info(ev, args):
+    """Return this interpreter process id and host memory figures."""
+    occupied = 0
+    page_size = getattr(os, "sysconf", lambda _k: 4096)("SC_PAGE_SIZE")
+    try:
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            occupied = int(statm.read().split()[1]) * int(page_size)
+    except (OSError, ValueError, IndexError, TypeError):
+        try:
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            occupied = int(usage * (1024 if sys.platform != "darwin" else 1))
+        except (ImportError, OSError, ValueError):
+            pass
+    try:
+        total = int(os.sysconf("SC_PHYS_PAGES") * page_size)
+    except (AttributeError, OSError, ValueError):
+        total = occupied
+    memory = V.Dictionary({
+        "occupied": V.Quantity(V.Integer(occupied), "B"),
+        "free": V.Quantity(V.Integer(max(0, total - occupied)), "B"),
+        "total": V.Quantity(V.Integer(total), "B"),
+    })
+    return V.Dictionary({"id": V.Integer(os.getpid()), "memory": memory})
+
+
+@builtin("terminate", arity=1)
+def _terminate(ev, args):
+    import signal
+
+    pid = to_int(args[0])
+    if pid <= 0:
+        fail("process id must be positive", "Value Error")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return VOID
+    except PermissionError as exc:
+        fail(str(exc), "System Error")
+    return VOID
+
+
+@builtin("superuser?", arity=0)
+def _superuser_q(ev, args):
+    if hasattr(os, "geteuid"):
+        return V.Logical(os.geteuid() == 0)
+    try:
+        import ctypes
+        return V.Logical(bool(ctypes.windll.shell32.IsUserAnAdmin()))
+    except (AttributeError, OSError):
+        return V.FALSE
 
 
 # ---------------------------------------------------------------------------

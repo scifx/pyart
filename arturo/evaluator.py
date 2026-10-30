@@ -83,6 +83,9 @@ class Context:
         # stack of value collectors: ``@[ loop ... ]`` gathers every value the
         # enclosed loops push (see ``Evaluator.emit``)
         self.collectors: List[List[V.Value]] = []
+        # Values left by top-level statements model Arturo's VM value stack.
+        # Nested block execution truncates back to its entry depth on return.
+        self.value_stack: List[V.Value] = []
         # per-frame flag: ``.inline`` functions run in the caller's scope, so
         # assignments must not be rolled back when the frame is popped
         self.inline_frames: List[bool] = []
@@ -231,6 +234,7 @@ class Evaluator:
                 if value is not V.VOID:
                     result = value
                     self.ctx.last_pushed = value
+                    self.ctx.value_stack.append(value)
                     # a statement that only ran a collector-aware block has
                     # already contributed its values
                     if (collector is not None and self.ctx.unscoped
@@ -436,13 +440,17 @@ class Evaluator:
                 return V.NULL
             return block
         tree = self._tree_for(block)
-        if scoped:
-            self.ctx.push_frame()
-            try:
-                return self.eval_node(tree)
-            finally:
-                self.ctx.pop_frame()
-        return self.eval_node(tree)
+        stack_depth = len(self.ctx.value_stack)
+        try:
+            if scoped:
+                self.ctx.push_frame()
+                try:
+                    return self.eval_node(tree)
+                finally:
+                    self.ctx.pop_frame()
+            return self.eval_node(tree)
+        finally:
+            del self.ctx.value_stack[stack_depth:]
 
     def do_block_scoped(self, block: V.Value) -> V.Value:
         """Evaluate a block with a fresh scope (used by `function.inline` etc.)"""
