@@ -1,27 +1,48 @@
 """
-evaluator.py - Walks the AST produced by :mod:`arturo.parser`.
+evaluator.py - Arturo's tree-walking evaluator.
 
-Each AST node carries its own :meth:`eval` step.  A :class:`Context` keeps the
-current scope and library.
+Semantics implemented here mirror Arturo's VM:
 
-Notable Arturo features supported:
-* right-to-left evaluation of infix expressions
-* dynamic function-table (so user-defined functions are called as
-  functions, not loaded as variables)
-* ``switch`` with multi-branch ``switch cond [then] [else]``
-* ``break`` / ``continue`` / ``return``
-* ``define :type [...]`` and ``to :type [...]`` (custom types)
-* path assignment (``a\\b: v``)
-* ``this`` keyword inside methods
+* nodes are evaluated **post-order** and children are visited in *reverse*
+  order (this is why argument side effects happen right-to-left);
+* ``call`` nodes resolve a symbol and invoke it with the evaluated children;
+* ``attribute`` nodes push on the *attribute stack*, which builtins pop with
+  ``ctx.popAttr("name")``;
+* blocks are plain values - they only run when something calls
+  :meth:`Evaluator.do_block` (``do``, ``if``, iterators, ...);
+* user functions get their own scope frame; plain blocks do **not**;
+* ``break``/``continue``/``return`` are implemented with signals.
+
+Errors are raised as :class:`ArturoError`, which ``try``/``try?`` turn into
+``:error`` values.
 """
 from __future__ import annotations
 
-import sys
-from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from . import parser as P
 from . import values as V
+
+
+# ---------------------------------------------------------------------------
+# Signals
+# ---------------------------------------------------------------------------
+class ArturoError(Exception):
+    """A runtime error that `try` can turn into an :error value."""
+
+    def __init__(self, kind: str, message: str, data: Optional[dict] = None):
+        super().__init__(f"{kind}: {message}")
+        self.kind = kind
+        self.message = message
+        self.data = data or {}
+
+    def to_value(self) -> V.Error:
+        d = {
+            "kind": V.String(self.kind),
+            "message": V.String(self.message),
+        }
+        for k, val in self.data.items():
+            d[k] = val if isinstance(val, V.Value) else V.String(str(val))
+        return V.Error(d)
 
 
 class ReturnSignal(Exception):
@@ -37,57 +58,121 @@ class ContinueSignal(Exception):
     pass
 
 
-class Context:
-    def __init__(self, library, scope=None, stack=None):
-        self.library = library
-        self.scope: Dict[str, V.Value] = scope if scope is not None else {}
-        self.stack: List[V.Value] = stack if stack is not None else []
-        # Current `this` object (for methods)
-        self.this_obj: Optional[V.Value] = None
+MISSING = object()
 
+
+# ---------------------------------------------------------------------------
+# Context
+# ---------------------------------------------------------------------------
+class Context:
+    """Symbol table + attribute stack + scope frames."""
+
+    def __init__(self, library, out=None):
+        self.library = library
+        self.syms: Dict[str, V.Value] = {}
+        self.frames: List[Dict[str, Any]] = []
+        self.attrs: List[tuple] = []
+        self.out = out
+        self.evaluator: Optional["Evaluator"] = None
+        self.this_obj: Optional[V.Value] = None
+        self.path = ["<script>"]
+        self.last_pushed: Optional[V.Value] = None
+        self.prev_pushed: Optional[V.Value] = None
+        self.error_kind = "Script Error"
+        self.trace: List[str] = []
+        # stack of value collectors: ``@[ loop ... ]`` gathers every value the
+        # enclosed loops push (see ``Evaluator.emit``)
+        self.collectors: List[List[V.Value]] = []
+        # per-frame flag: ``.inline`` functions run in the caller's scope, so
+        # assignments must not be rolled back when the frame is popped
+        self.inline_frames: List[bool] = []
+        # ``True`` while a block is being executed "unscoped" (Arturo's
+        # ``execUnscoped``): every statement leaves its value on the stack, so
+        # an enclosing ``@[...]`` block can harvest them
+        self.unscoped = False
+        self.emitted = False
+        self.standalone = True
+        self.depth = 0
+        self.cwd = None
+
+    # -- symbols ---------------------------------------------------------
     def get(self, name: str) -> V.Value:
-        v = self.scope.get(name)
-        if v is None:
-            if name == "pi":
-                return V.Floating(3.141592653589793)
-            if name == "epsilon":
-                return V.Floating(2.718281828459045)
-            if name == "true":
-                return V.Logical(True)
-            if name == "false":
-                return V.Logical(False)
-            if name == "maybe":
-                return V.Logical("maybe")
-            if name == "null":
-                return V.Null()
-            if name == "this":
-                return self.this_obj if self.this_obj is not None else V.Null()
-            fn = self.library.lookup(name)
-            if fn is not None:
-                return fn
-            return V.Null()
-        return v
+        v = self.syms.get(name, MISSING)
+        if v is not MISSING:
+            return v
+        if name == "this":
+            if self.this_obj is not None:
+                return self.this_obj
+            raise ArturoError("Name Error", "Identifier not found: this")
+        fn = self.library.lookup(name)
+        if fn is not None:
+            return fn
+        const = self.library.constant(name)
+        if const is not None:
+            return const
+        raise ArturoError("Name Error", f"Identifier not found: {name}")
+
+    def has(self, name: str) -> bool:
+        return (name in self.syms or self.library.lookup(name) is not None
+                or self.library.constant(name) is not None)
 
     def set(self, name: str, value: V.Value) -> None:
-        self.scope[name] = value
+        if self.frames and not self.inline_frames[-1]:  # fast path below
+            frame = self.frames[-1]
+            if name not in frame:
+                frame[name] = self.syms.get(name, MISSING)
+        self.syms[name] = value
 
+    def declare(self, name: str, value: V.Value) -> None:
+        self.set(name, value)
 
-# ---------------------------------------------------------------------------
-# Symbol -> function name mapping for infix aliases
-# ---------------------------------------------------------------------------
-_SYMBOL_TO_FUNC = {
-    "+": "add", "++": "append", "-": "sub", "--": "remove",
-    "*": "mul", "**": "pow", "/": "div", "//": "fdiv",
-    "/%": "divmod", "%": "mod", "^": "pow",
-    "=": "equal?", "==": "equal?", "<>": "notEqual?",
-    "<": "less?", "<=": "lessOrEqual?", "=<": "lessOrEqual?",
-    ">": "greater?", ">=": "greaterOrEqual?",
-    "..": "range", "...": "range3",
-    "&": "and?", "∧": "and?", "|": "or?", "∨": "or?",
-    "?": "switch", "@": "array", "#": "dictionary",
-    "!!": "doubleNegation", "~": "render",
-    "!": "not?",
-}
+    def unset(self, name: str) -> None:
+        if name in self.syms:
+            del self.syms[name]
+
+    # -- scopes ----------------------------------------------------------
+    def push_frame(self, initial: Optional[Dict[str, V.Value]] = None,
+                   inline: bool = False) -> Dict[str, Any]:
+        frame: Dict[str, Any] = {}
+        self.frames.append(frame)
+        self.inline_frames.append(inline)
+        if initial:
+            for k, v in initial.items():
+                self.set(k, v)
+        return frame
+
+    def pop_frame(self) -> None:
+        self.inline_frames.pop()
+        frame = self.frames.pop()
+        for name, previous in frame.items():
+            if previous is MISSING:
+                self.syms.pop(name, None)
+            else:
+                self.syms[name] = previous
+
+    # -- attributes ------------------------------------------------------
+    def push_attr(self, name: str, value: V.Value) -> None:
+        self.attrs.append((name, value))
+
+    def pop_attr(self, name: str, default=MISSING):
+        for i in range(len(self.attrs) - 1, -1, -1):
+            if self.attrs[i][0] == name:
+                return self.attrs.pop(i)[1]
+        return default
+
+    def has_attr(self, name: str) -> bool:
+        return any(a[0] == name for a in self.attrs)
+
+    def peek_attr(self, name: str, default=None):
+        for i in range(len(self.attrs) - 1, -1, -1):
+            if self.attrs[i][0] == name:
+                return self.attrs[i][1]
+        return default
+
+    def clear_attrs(self) -> List[tuple]:
+        a = self.attrs
+        self.attrs = []
+        return a
 
 
 # ---------------------------------------------------------------------------
@@ -96,479 +181,341 @@ _SYMBOL_TO_FUNC = {
 class Evaluator:
     def __init__(self, ctx: Context):
         self.ctx = ctx
+        ctx.evaluator = self
+        self._ast_cache: Dict[int, Any] = {}
+        self._ast_lib_version = 0
 
-    # -- top level --------------------------------------------------------
-    def exec_program(self, stmts: List[object]) -> Optional[V.Value]:
-        last: Optional[V.Value] = None
-        i = 0
-        while i < len(stmts):
-            s = stmts[i]
-            try:
-                if isinstance(s, P.SExpr):
-                    last = self.eval_expr(s.expr)
-                elif isinstance(s, P.SAssign):
-                    val = self.eval_expr(s.value)
-                    self.ctx.set(s.name, val)
-                    last = val
-                elif isinstance(s, P.SPathAssign):
-                    val = self.eval_expr(s.value)
-                    self._set_path(s.path, val)
-                    last = val
-                elif isinstance(s, P.SReturn):
-                    raise ReturnSignal(self.eval_expr(s.value))
-                elif isinstance(s, P.SIf):
-                    cond = self._reduce(s.cond)
-                    if V.truthy(cond):
-                        last = self._exec_branch(s.then_branch)
-                    elif s.else_branch is not None:
-                        last = self._exec_branch(s.else_branch)
-                elif isinstance(s, P.SWhile):
-                    last = self._exec_while(s.cond, s.body)
-                elif isinstance(s, tuple) and s and s[0] == "loop":
-                    last = self._exec_loop(s[1])
-                elif isinstance(s, P.SBreak):
-                    raise BreakSignal()
-                elif isinstance(s, P.SContinue):
-                    raise ContinueSignal()
-                elif isinstance(s, P.SEmpty):
-                    pass
-                else:
-                    last = self.eval_expr(s)
-            except BreakSignal:
-                # propagate up out of loops
-                raise
-            except ContinueSignal:
-                # if we're inside a loop, swallow; otherwise re-raise
-                # (we don't track nesting explicitly; assume caller is loop)
-                raise
-            i += 1
-        return last
-
-    # -- expression eval --------------------------------------------------
-    def eval_expr(self, node) -> V.Value:
-        if isinstance(node, P.EValue):
+    # -- public API ------------------------------------------------------
+    def eval_node(self, node) -> V.Value:
+        kind = node.kind
+        if kind == "constant":
             return node.value
-        if isinstance(node, P.EVar):
-            return self.ctx.get(node.name)
-        if isinstance(node, P.ELiteral):
-            # ``'foo`` evaluates to the variable named foo
-            return self.ctx.get(node.name)
-        if isinstance(node, P.EPathLiteral):
-            return self._get_path_literal(node)
-        if isinstance(node, P.EPath):
-            return self._get_path(node)
-        if isinstance(node, P.ESym):
-            return self._eval_sym(node)
-        if isinstance(node, P.ECall):
+        if kind == "variable":
+            name = node.value.data
+            return self.ctx.get(name)
+        if kind == "store":
+            fast = node.fast
+            if fast is not None and not self.ctx.unscoped:
+                return fast(self)
+            value = self._eval_children_first(node)
+            if value is V.VOID:
+                return value
+            # values are mutable references in Arturo: a value coming from a
+            # (frozen) source literal is detached when bound to a variable, so
+            # in-place updates are visible through every alias of it
+            if getattr(value, "frozen", False) and value.kind in (
+                    "string", "block", "inline", "dictionary", "object"):
+                value = V.copy_value(value, deep=False)
+            self.ctx.set(node.value.data, value)
+            return value
+        if kind == "attribute":
+            value = self._eval_children_first(node)
+            self.ctx.push_attr(node.value.data, value)
+            return V.NULL
+        if kind == "call":
+            fast = node.fast
+            if fast is not None and not self.ctx.unscoped:
+                result = fast(self)
+                if result is not None:
+                    return result
             return self._eval_call(node)
-        if isinstance(node, P.EBlock):
-            # Use the LAST item's value (like ``while [cond]``).
-            if not node.items:
-                return V.Null()
-            last = V.Null()
-            for it in node.items:
-                if isinstance(it, V.Value):
-                    last = it
-                else:
-                    last = self.eval_expr(it)
-            return last
-        if isinstance(node, P.EInline):
-            if not node.items:
-                return V.Null()
-            last = V.Null()
-            for it in node.items:
-                if isinstance(it, V.Value):
-                    last = it
-                else:
-                    last = self.eval_expr(it)
-            return last
-        if isinstance(node, P.EArrow):
-            return self.eval_expr(node.body)
-        if isinstance(node, P.EFatArrow):
-            target = self.eval_expr(node.target)
-            return self._fat_arrow(target)
-        if isinstance(node, P.EColon):
-            items = [self.eval_expr(c) for c in node.items]
-            return V.Block(items)
-        if isinstance(node, P.SAssign):
-            # Bare label as expression (rare): just null
-            return V.Null()
-        raise RuntimeError(f"Unknown AST node: {node!r}")
+        if kind == "root":
+            result: V.Value = V.VOID
+            for child in node.children:
+                collector = self.ctx.collectors[-1] if self.ctx.collectors else None
+                before = len(collector) if collector is not None else 0
+                fast = child.fast
+                value = fast(self) if (fast is not None and not self.ctx.unscoped) else self.eval_node(child)
+                if value is None:
+                    value = self.eval_node(child)
+                if value is not V.VOID:
+                    result = value
+                    self.ctx.last_pushed = value
+                    # a statement that only ran a collector-aware block has
+                    # already contributed its values
+                    if (collector is not None and self.ctx.unscoped
+                            and len(collector) == before):
+                        collector.append(value)
+            return result
+        raise ArturoError("VM Error", f"Unknown node kind: {kind}")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _reduce(self, node) -> V.Value:
-        if isinstance(node, P.EBlock):
-            if not node.items:
-                return V.Null()
-            last = V.Null()
-            for it in node.items:
-                if isinstance(it, V.Value):
-                    last = it
-                else:
-                    last = self.eval_expr(it)
-            return last
-        return self.eval_expr(node)
+    def _eval_children_first(self, node) -> V.Value:
+        result: V.Value = V.NULL
+        for child in reversed(node.children):
+            result = self.eval_node(child)
+        return result
 
-    def _exec_branch(self, branch) -> Optional[V.Value]:
-        if isinstance(branch, P.EBlock):
-            last: Optional[V.Value] = None
-            for item in branch.items:
-                last = self.eval_expr(item)
-            return last
-        if isinstance(branch, P.EArrow):
-            return self.eval_expr(branch.body)
-        if isinstance(branch, tuple) and branch and branch[0] == "loop":
-            return self._exec_loop(branch[1])
-        return self.eval_expr(branch)
-
-    def _exec_while(self, cond, body) -> V.Value:
-        last = V.Null()
-        while True:
-            try:
-                cond_v = self._reduce(cond)
-                if not V.truthy(cond_v):
-                    break
-                last = self._exec_branch(body_ast)
-            except ContinueSignal:
+    def _eval_call(self, node):
+        ctx = self.ctx
+        # `else` needs the value the previous statement pushed
+        ctx.prev_pushed = ctx.last_pushed
+        args: List[V.Value] = []
+        # children are evaluated right-to-left
+        for child in reversed(node.children):
+            value = self.eval_node(child)
+            if child.kind == "attribute":
                 continue
-            except BreakSignal:
-                break
-        return last
-
-    def _exec_loop(self, expr) -> V.Value:
-        """``loop collection 'var body`` — expr is an ECall to ``loop``."""
-        from .stdlib import _iter as _std_iter
-        if not isinstance(expr, P.ECall):
-            return V.Null()
-        # Do NOT pre-evaluate all args.  Evaluate only the collection;
-        # the body and binding literal must remain as AST nodes.
-        coll = self.eval_expr(expr.args[0])
-        # Literal bind name (if any)
-        bind_name: Optional[str] = None
-        body_ast = None
-        if len(expr.args) >= 2:
-            if isinstance(expr.args[1], P.EValue) and isinstance(expr.args[1].value, V.VLiteral):
-                bind_name = expr.args[1].value.name
-                if len(expr.args) >= 3:
-                    body_ast = expr.args[2]
-            else:
-                body_ast = expr.args[1]
-        if body_ast is None:
-            return V.Null()
-        last = V.Null()
-        for item in _std_iter(coll):
-            saved = self.ctx.scope.get(bind_name) if bind_name else None
-            if bind_name:
-                self.ctx.scope[bind_name] = item
-            try:
-                last = self._exec_branch(body_ast)
-            except ContinueSignal:
+            if value is V.VOID:
                 continue
-            except BreakSignal:
-                break
-            finally:
-                if bind_name is not None:
-                    if saved is not None:
-                        self.ctx.scope[bind_name] = saved
-                    else:
-                        self.ctx.scope.pop(bind_name, None)
-        return last
+            args.append(value)
+        args.reverse()
 
-    def _eval_sym(self, node: P.ESym) -> V.Value:
-        sym_to_func = _SYMBOL_TO_FUNC
-        fname = sym_to_func.get(node.op, node.op)
-        fn = self.ctx.library.lookup(fname)
-        if fn is None:
-            # Try bitwise operators and other specialised names
-            fn = self.ctx.library.lookup(node.op)
-        if fn is None:
-            raise RuntimeError(f"Unknown infix operator: {node.op!r}")
-        if node.left is None:
-            arg = self.eval_expr(node.right)
-            return fn.impl(self.ctx, [arg])
-        left = self.eval_expr(node.left)
-        right = self.eval_expr(node.right)
-        return fn.impl(self.ctx, [left, right])
-
-    def _eval_call(self, node: P.ECall) -> V.Value:
-        # Special forms
-        if isinstance(node.func, P.EVar):
-            if node.func.name == "__build_function__":
-                return self._build_function(node.args)
-            if node.func.name == "__build_type__":
-                return self._build_type(node.args)
-            # ``map``/``select``/``filter``/``do`` -- keep AST nodes for args
-            # that are blocks so the body is evaluated per-iteration.
-            if node.func.name in ("map", "select", "filter", "do"):
-                fn = self.ctx.library.lookup(node.func.name)
-                return self._call_higher_order(fn, node.args)
-        func = self.eval_expr(node.func) if isinstance(node.func, P.EVar) else node.func
-        args = [self.eval_expr(a) for a in node.args]
-        if isinstance(func, V.VBuiltinFunction):
-            return func.impl(self.ctx, args)
-        if isinstance(func, V.VFunction):
-            return self._call_user_function(func, args)
-        if isinstance(func, V.VObject):
-            # Object call - treat as method call on self
-            # But normally methods are accessed via path
-            return V.Null()
-        return V.Null()
-
-    def _call_higher_order(self, fn, ast_args: List[object]) -> V.Value:
-        """Call map/select/filter/do without pre-evaluating block bodies.
-
-        ``ast_args`` is the raw list of AST nodes; we evaluate only the
-        collection and the literal binding name here, and keep the body
-        as an AST node for iteration.
-        """
-        # evaluate the collection
-        if not ast_args:
-            return V.Null()
-        coll = self.eval_expr(ast_args[0])
-        # determine binding and body
-        bind_name = None
-        body_ast = None
-        if len(ast_args) >= 2:
-            if isinstance(ast_args[1], P.EValue) and isinstance(ast_args[1].value, V.VLiteral):
-                bind_name = ast_args[1].value.name
-                if len(ast_args) >= 3:
-                    body_ast = ast_args[2]
-            else:
-                body_ast = ast_args[1]
-        if body_ast is None:
-            return V.Null()
-        from .stdlib import _iter as _std_iter
-        out: List[V.Value] = []
-        for item in _std_iter(coll):
-            if bind_name:
-                saved = self.ctx.scope.get(bind_name)
-                self.ctx.scope[bind_name] = item
-            try:
-                # ``do`` is special: evaluate the body block as-is
-                if fn.name == "do" and isinstance(body_ast, P.EBlock):
-                    last = V.Null()
-                    for sub in body_ast.items:
-                        if isinstance(sub, V.Value):
-                            last = self.eval_expr(sub)
-                        else:
-                            last = self.eval_expr(sub)
-                    out.append(last)
-                    continue
-                # body execution
-                if isinstance(body_ast, P.EBlock):
-                    last = V.Null()
-                    for sub in body_ast.items:
-                        if isinstance(sub, V.Value):
-                            last = sub
-                        else:
-                            last = self.eval_expr(sub)
-                    res = last
-                elif isinstance(body_ast, P.EArrow):
-                    res = self.eval_expr(body_ast.body)
-                else:
-                    res = self.eval_expr(body_ast)
-                if fn.name == "map":
-                    out.append(res)
-                elif fn.name == "select":
-                    if V.truthy(res):
-                        out.append(item)
-                elif fn.name == "filter":
-                    if not V.truthy(res):
-                        out.append(item)
-            finally:
-                if bind_name is not None:
-                    if saved is not None:
-                        self.ctx.scope[bind_name] = saved
-                    else:
-                        self.ctx.scope.pop(bind_name, None)
-        return V.Block(out)
-
-    def _build_function(self, args: List[object]) -> V.VFunction:
-        params: List[str] = []
-        if args and isinstance(args[0], P.EValue) and isinstance(args[0].value, V.VString):
-            params = [p for p in args[0].value.data.split("|") if p]
-        body = V.Block(args[1].items) if len(args) > 1 and isinstance(args[1], P.EBlock) else V.Block([])
-        return V.Function(params=params, body=body)
-
-    def _build_type(self, args: List[object]) -> V.VObject:
-        """Build a custom type prototype object."""
-        type_name = ""
-        if args and isinstance(args[0], P.EValue) and isinstance(args[0].value, V.VString):
-            type_name = args[0].value.data
-        # Build a prototype object that holds methods
-        proto = V.Object(type_name=type_name)
-        if len(args) > 1 and isinstance(args[1], P.EBlock):
-            for item in args[1].items:
-                if isinstance(item, P.SAssign):
-                    # ``init: method [...]`` or ``init: constructor [...]``
-                    method_body = item.value
-                    # Wrap into a function.  Use method/constructor markers.
-                    if isinstance(method_body, P.ECall) and isinstance(method_body.func, P.EVar):
-                        if method_body.func.name in ("method", "constructor"):
-                            # method [...]: a function with implicit `this`
-                            params = []
-                            if method_body.args and isinstance(method_body.args[0], P.EBlock):
-                                params = [p.name for p in method_body.args[0].items if isinstance(p, V.VWord)]
-                            body_block = method_body.args[1] if len(method_body.args) > 1 else None
-                            if isinstance(body_block, P.EBlock):
-                                fn = V.Function(params=params, body=V.Block(body_block.items))
-                                proto.fields[item.name] = fn
-                            elif isinstance(body_block, P.EArrow):
-                                fn = V.Function(params=params, body=V.Block([body_block.body]))
-                                proto.fields[item.name] = fn
-                    else:
-                        # plain method: ``methodName: <block or arrow>``
-                        method_body = item.value
-                        params = []
-                        if isinstance(method_body, P.EBlock):
-                            params = [p.name for p in method_body.items if isinstance(p, V.VWord)]
-                            fn = V.Function(params=params, body=method_body)
-                            proto.fields[item.name] = fn
-                        elif isinstance(method_body, P.EArrow):
-                            fn = V.Function(params=params, body=V.Block([method_body.body]))
-                            proto.fields[item.name] = fn
-        # Register the prototype so ``to :type args`` can find it
-        self.ctx.library.register_type(type_name, proto)
-        return proto
-
-    def _call_user_function(self, func: V.VFunction, args: List[V.Value]) -> V.Value:
-        old_scope = self.ctx.scope
-        old_this = self.ctx.this_obj
-        new_scope = dict(old_scope)  # inherit parent scope
-        for i, p in enumerate(func.params):
-            if i < len(args):
-                new_scope[p] = args[i]
-            else:
-                new_scope[p] = V.Null()
-        self.ctx.scope = new_scope
-        try:
-            ev = Evaluator(self.ctx)
-            if not isinstance(func.body, V.VBlock):
-                return V.Null()
-            stmts: List[object] = []
-            for item in func.body.items:
-                if isinstance(item, V.Value):
-                    stmts.append(P.SExpr(P.EValue(item)))
-                elif isinstance(item, (P.SExpr, P.SAssign, P.SIf, P.SWhile, P.SReturn, P.SBreak, P.SContinue)):
-                    stmts.append(item)
-                else:
-                    stmts.append(P.SExpr(item))
-            try:
-                last = ev.exec_program(stmts)
-            except ReturnSignal as ret:
-                return ret.value
-            return last if last is not None else V.Null()
-        finally:
-            self.ctx.scope = old_scope
-            self.ctx.this_obj = old_this
-
-    def _fat_arrow(self, target) -> V.VFunction:
-        if isinstance(target, V.VBuiltinFunction):
-            arity = max(target.arity, 0)
-        elif isinstance(target, V.VFunction):
-            arity = len(target.params)
+        name = node.name
+        fn = ctx.syms.get(name)
+        if fn is None or not isinstance(fn, V.Function):
+            fn = node.cache
+            if fn is None:
+                fn = self._resolve_callable(name)
+                node.cache = fn
+        # a call starts a fresh (scoped) evaluation context: value collection
+        # only applies to the statement level of an unscoped block
+        saved_unscoped = ctx.unscoped
+        if saved_unscoped:
+            ctx.unscoped = False
+        impl = fn.impl
+        if impl is not None:
+            result = impl(self, args)
         else:
-            arity = 1
-        params = [f"__a{i}__" for i in range(arity)]
-        body_items: List[V.Value] = []
-        body_items.append(V.Word(target.name if isinstance(target, V.VBuiltinFunction) else "do"))
-        for i in range(arity):
-            body_items.append(V.Word(params[i]))
-        return V.Function(params=params, body=V.Block(body_items))
+            result = self._call_user(fn, args, name)
+        if saved_unscoped:
+            ctx.unscoped = saved_unscoped
+        if result is not V.VOID:
+            self.ctx.last_pushed = result
+        return result
 
-    # ------------------------------------------------------------------
-    # Path support
-    # ------------------------------------------------------------------
-    def _get_path(self, node: P.EPath) -> V.Value:
-        root = self.eval_expr(node.root)
-        key = self.eval_expr(node.key)
-        return self._path_get(root, key)
+    def _resolve_callable(self, name: str) -> V.Function:
+        fn = self.ctx.syms.get(name, MISSING)
+        if fn is MISSING:
+            fn = self.ctx.library.lookup(name)
+        if fn is MISSING or not isinstance(fn, V.Function):
+            raise ArturoError("Name Error", f"Identifier not found: {name}")
+        return fn
 
-    def _get_path_literal(self, node: P.EPathLiteral) -> V.Value:
-        # ``'a\b`` — get the value of variable ``a\b`` (special)
-        # In Arturo, a path literal is an unevaluated path expression.
-        # For now treat like getting root with key from a\b path.
-        return self.ctx.get(node.root + "\\" + node.key)
+    def _trace_suffix(self) -> str:
+        if not self.ctx.trace:
+            return ""
+        return "\n  in: " + " <- ".join(reversed(self.ctx.trace[-8:]))
 
-    def _path_get(self, root, key) -> V.Value:
-        key_name = self._key_to_str(key)
-        if isinstance(root, V.VDictionary):
-            if key_name in root.items:
-                return root.items[key_name]
-            return V.Null()
-        if isinstance(root, V.VObject):
-            if key_name in root.fields:
-                return root.fields[key_name]
-            return V.Null()
-        if isinstance(root, V.VBlock):
+    # -- calling ---------------------------------------------------------
+    def call(self, fn: V.Function, args: List[V.Value], name: str = "") -> V.Value:
+        self.ctx.trace.append(name or fn.name)
+        try:
+            if fn.is_builtin:
+                return self._call_builtin(fn, args)
+            return self._call_user(fn, args, name or fn.name)
+        finally:
+            self.ctx.trace.pop()
+
+    def _call_builtin(self, fn: V.Function, args: List[V.Value]) -> V.Value:
+        if len(args) != fn.arity:
+            raise ArturoError(
+                "Value Error",
+                f"Not enough parameters\nCannot perform: {fn.name}"
+                + self._trace_suffix(),
+            )
+        self.ctx.current_fn = fn.name
+        self.ctx.depth += 1
+        if self.ctx.depth > 2000:
+            self.ctx.depth -= 1
+            raise ArturoError("Stack Error", "Stack limit exceeded")
+        try:
+            return fn.impl(self, args)
+        except ArturoError:
+            raise
+        except (BreakSignal, ContinueSignal, ReturnSignal):
+            raise
+        except RecursionError:
+            raise ArturoError("Stack Error", "Stack limit exceeded")
+        except ZeroDivisionError:
+            raise ArturoError("Arithmetic Error", "Division by zero")
+        except ValueError as exc:
+            raise ArturoError("Value Error", str(exc))
+        finally:
+            self.ctx.depth -= 1
+
+    def _call_user(self, fn: V.Function, args: List[V.Value], name: str) -> V.Value:
+        if len(args) != fn.arity:
+            raise ArturoError(
+                "Value Error",
+                f"Not enough parameters\nCannot perform: {name}",
+            )
+        param_types = getattr(fn, "param_types", {})
+        for param, arg in zip(fn.params, args):
+            pname = param_name(param)
+            expected = param_types.get(pname, ())
+            if not expected or "any" in expected:
+                continue
+            actual = arg.kind
+            if isinstance(arg, V.Object) and isinstance(arg.proto, V.Type):
+                actual = arg.proto.data
+            if not any(actual == t for t in expected):
+                raise ArturoError("Assertion Failed", "Assertion failed")
+        if fn.memoize:
+            key = tuple(V.value_key(a) for a in args)
+            if not hasattr(fn, "_memo"):
+                fn._memo = {}
+            if len(fn._memo) > 200_000:
+                fn._memo.clear()
+            if key in fn._memo:
+                return fn._memo[key]
+
+        self.ctx.depth += 1
+        if self.ctx.depth > 12000:
+            self.ctx.depth -= 1
+            raise ArturoError("Stack Error", "Stack limit exceeded")
+
+        params = [p for p in fn.params if not isinstance(p, V.Type)]
+        self.ctx.push_frame(inline=fn.inline)
+        if fn.inline:
+            # only the parameters themselves are scoped
+            frame = self.ctx.frames[-1]
+            for param in params:
+                name = param_name(param)
+                frame.setdefault(name, self.ctx.syms.get(name, MISSING))
+
+        prev_this = self.ctx.this_obj
+        try:
+            for key, value in getattr(fn, "imports", {}).items():
+                self.ctx.set(key, value)
+            for param, arg in zip(params, args):
+                self.ctx.set(param_name(param), arg)
             try:
-                idx = int(key_name)
-                if 0 <= idx < len(root.items):
-                    item = root.items[idx]
-                    if isinstance(item, V.Value):
-                        return item
-                    return self.eval_expr(item)
-            except (ValueError, IndexError):
-                pass
-            return V.Null()
-        return V.Null()
+                result = self.do_block(fn.body, scoped=False)
+            except ReturnSignal as ret:
+                result = ret.value
+        finally:
+            # ``.export:[x]`` - hand variables back to the caller's scope
+            exported = {}
+            names = getattr(fn, "exports", None)
+            if names is not None:
+                items = names.data if isinstance(names, V.Block) else [names]
+                for item in items:
+                    key = item.data if isinstance(item, (V.Literal, V.Word)) else V.to_string(item)
+                    if key in self.ctx.syms:
+                        exported[key] = self.ctx.syms[key]
+            self.ctx.this_obj = prev_this
+            self.ctx.pop_frame()
+            for key, value in exported.items():
+                self.ctx.set(key, value)
+            self.ctx.depth -= 1
 
-    def _key_to_str(self, key) -> str:
-        if isinstance(key, V.VString):
-            return key.data
-        if isinstance(key, V.VWord):
-            return key.name
-        if isinstance(key, V.VLiteral):
-            return key.name
-        if isinstance(key, V.VInteger):
-            return str(key.data)
-        return str(getattr(key, "data", ""))
+        if fn.memoize:
+            fn._memo[key] = result
+        return result
 
-    def _set_path(self, path_node, value) -> None:
-        # path_node is EPath starting from EVar/EValue/ELiteral root.
-        # Walk to the second-to-last component, then assign to the last.
-        if not isinstance(path_node, P.EPath):
-            # Direct assignment (rare)
-            return
-        # Drill into root
-        nodes = self._flatten_path(path_node)
-        # nodes: [root, key1, key2, ...]
-        if len(nodes) < 2:
-            return
-        # Evaluate all but the last
-        target = self.eval_expr(nodes[0])
-        for n in nodes[1:-1]:
-            key = self.eval_expr(n)
-            key_name = self._key_to_str(key)
-            if isinstance(target, V.VDictionary):
-                # Ensure key exists (default null)
-                if key_name not in target.items:
-                    target.items[key_name] = V.Null()
-                target = target.items[key_name]
-            elif isinstance(target, V.VObject):
-                if key_name not in target.fields:
-                    target.fields[key_name] = V.Null()
-                target = target.fields[key_name]
-            else:
-                return
-        last_key = self.eval_expr(nodes[-1])
-        last_key_name = self._key_to_str(last_key)
-        if isinstance(target, V.VDictionary):
-            target.items[last_key_name] = value
-        elif isinstance(target, V.VObject):
-            target.fields[last_key_name] = value
+    # -- blocks ----------------------------------------------------------
+    # -- value collection (for ``@[ ... ]``) -----------------------------
+    def emit(self, value: V.Value) -> None:
+        """Push a value into the active collector (inline block or none)."""
+        if self.ctx.collectors:
+            self.ctx.collectors[-1].append(value)
 
-    def _flatten_path(self, node: P.EPath) -> List[object]:
-        """Turn ``a\b\c`` into ``[EVar(a), ELiteral(b), ELiteral(c)]``."""
-        parts: List[object] = []
-        # Walk down the path, collecting left-to-right.
-        def walk(n, acc):
-            if isinstance(n, P.EPath):
-                walk(n.root, acc)
-                acc.append(n.key)
-            else:
-                acc.append(n)
-        walk(node, parts)
-        return parts
+    def collect_block(self, block: V.Block) -> List[V.Value]:
+        items: List[V.Value] = []
+        self.ctx.collectors.append(items)
+        try:
+            self.do_block_unscoped(block)
+        finally:
+            self.ctx.collectors.pop()
+        return items
+
+    def do_block_unscoped(self, block: V.Value) -> V.Value:
+        """Evaluate a block the way Arturo's ``execUnscoped`` does: statements
+        leave their values behind instead of discarding them."""
+        saved = self.ctx.unscoped
+        self.ctx.unscoped = True
+        try:
+            return self.do_block(block)
+        finally:
+            self.ctx.unscoped = saved
+
+    def do_block(self, block: V.Value, scoped: bool = False) -> V.Value:
+        """Evaluate a block (or inline) in the current scope."""
+        if not isinstance(block, V.Block):
+            if block is None:
+                return V.NULL
+            return block
+        tree = self._tree_for(block)
+        if scoped:
+            self.ctx.push_frame()
+            try:
+                return self.eval_node(tree)
+            finally:
+                self.ctx.pop_frame()
+        return self.eval_node(tree)
+
+    def do_block_scoped(self, block: V.Value) -> V.Value:
+        """Evaluate a block with a fresh scope (used by `function.inline` etc.)"""
+        return self.do_block(block, scoped=True)
+
+    def _tree_for(self, block: V.Block):
+        from . import ast as A
+
+        data = block.data
+        version = self.ctx.library._version
+        if (getattr(block, "_tree_data", None) is data
+                and getattr(block, "_tree_len", -1) == len(data)
+                and getattr(block, "_tree_version", None) == version):
+            return block._tree
+        tree = A.build(block, self.ctx.library, self.ctx.syms)
+        block._tree = tree
+        block._tree_data = data
+        block._tree_len = len(data)
+        block._tree_version = version
+        return tree
+
+    # -- helpers for builtins -------------------------------------------
+    def eval_value(self, v: V.Value) -> V.Value:
+        """Evaluate a single value (block => run it, other => itself)."""
+        if isinstance(v, V.Block):
+            return self.do_block(v)
+        return v
+
+    def inplace_target(self, arg: V.Value):
+        """Resolve a Literal/PathLiteral to (getter, setter) for in-place ops."""
+        ctx = self.ctx
+        if isinstance(arg, V.Literal):
+            name = arg.data
+            return (lambda: ctx.get(name), lambda v: ctx.set(name, v))
+        if isinstance(arg, V.PathLiteral):
+            parts = arg.data
+            root = parts[0].data
+            base = lambda: ctx.get(root)
+
+            def getter():
+                cur = ctx.get(root)
+                for key in parts[1:]:
+                    cur = _get_path(self, cur, key)
+                return cur
+
+            def setter(value):
+                if len(parts) == 1:
+                    ctx.set(root, value)
+                    return
+                container = ctx.get(root)
+                for key in parts[1:-1]:
+                    container = _get_path(self, container, key)
+                _set_path(self, container, parts[-1], value)
+
+            return getter, setter
+        raise ArturoError("Value Error", "Given value is not a literal")
+
+
+def param_name(param: V.Value) -> str:
+    if isinstance(param, V.Word):
+        return param.data
+    if isinstance(param, V.Literal):
+        return param.data
+    return str(param)
+
+
+def _get_path(ev: "Evaluator", container: V.Value, key: V.Value) -> V.Value:
+    from . import builtins_collections as BC
+
+    return BC.get_value(ev, container, key)
+
+
+def _set_path(ev: "Evaluator", container: V.Value, key: V.Value, value: V.Value) -> None:
+    from . import builtins_collections as BC
+
+    BC.set_value(ev, container, key, value)

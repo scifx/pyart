@@ -1,79 +1,99 @@
 """
-arturo_mini - a tiny Arturo interpreter in Python.
+arturo - a Python implementation of the Arturo programming language.
 
-Public API:
+Public API::
 
-* :class:`Interpreter` - run source code
-* :func:`run` - convenience helper
-* :mod:`values`, :mod:`parser`, :mod:`evaluator`, :mod:`library`, :mod:`stdlib`
+    from arturo import Interpreter
+    Interpreter().exec('print "Hello world!"')
+
+The implementation follows Arturo's own architecture:
+
+    parser.py     source  ->  Block of values      (port of vm/parse.nim)
+    ast.py        Block   ->  Node tree            (port of vm/ast.nim)
+    evaluator.py  Node    ->  evaluated values     (port of vm/eval.nim + exec.nim)
+    builtins/     the standard library
 """
 from __future__ import annotations
 
-from typing import List, Optional
+import io
+import math
+import sys
 
+try:  # allow arbitrarily long integers when printing/parsing
+    sys.set_int_max_str_digits(0)
+except AttributeError:  # pragma: no cover - Python < 3.11
+    pass
+sys.setrecursionlimit(20000)
+from typing import List, Optional, TextIO
+
+from . import ast as _ast
 from . import evaluator as _E
 from . import library as _L
 from . import parser as _P
-from . import stdlib as _stdlib
 from . import values as V
 
+__all__ = ["Interpreter", "run", "eval", "values", "parser", "ast", "evaluator",
+           "library", "Error", "ArturoError"]
 
-__all__ = [
-    "Interpreter",
-    "run",
-    "eval",
-    "values",
-    "parser",
-    "evaluator",
-    "library",
-    "stdlib",
-]
+ArturoError = _E.ArturoError
+Error = _E.ArturoError
 
 
 class Interpreter:
-    """A re-usable Arturo interpreter."""
+    """A reusable Arturo interpreter."""
 
-    def __init__(self, modules: Optional[List[_stdlib.Module]] = None):
+    def __init__(self, out: Optional[TextIO] = None, argv: Optional[List[str]] = None):
         self.library = _L.Library()
-        _stdlib.load_modules(
-            self.library,
-            modules or _stdlib.DEFAULT_MODULES,
-        )
-        self.context = _E.Context(self.library)
-        # Names that have been bound to user functions in this session
-        # (so future ``f args`` calls are parsed as function calls).
-        self._user_functions: set = set()
+        from .builtins import install
 
-    def exec(self, source: str) -> Optional[V.Value]:
-        parser = _P.Parser(source, self.library._fns, known_functions=self._user_functions)
-        ast = parser.parse()
-        ev = _E.Evaluator(self.context)
+        install(self.library)
+        from .builtins.numbers import register_constants
+
+        register_constants(self.library)
+        self.context = _E.Context(self.library, out=out)
+        for _name, _value in self.library.constants.items():
+            self.context.set(_name, _value)
+        self.context.argv = argv or []
+        self.context.path = ["<script>"]
+        self.evaluator = _E.Evaluator(self.context)
+        self.context.evaluator = self.evaluator
+
+    # -- running code ----------------------------------------------------
+    def exec(self, source: str, path: str = "<script>") -> Optional[V.Value]:
+        """Parse and evaluate ``source``, returning its last value."""
+        self.context.path = [path]
+        block = _P.parse(source)
+        tree = _ast.build(block, self.library, self.context.syms)
         try:
-            return ev.exec_program(ast)
+            return self.evaluator.eval_node(tree)
+        except _E.ReturnSignal as ret:
+            return ret.value
         except _E.BreakSignal:
-            return V.Null()
+            return V.NULL
         except _E.ContinueSignal:
-            return V.Null()
-        finally:
-            # Carry over any newly defined functions so subsequent execs
-            # parse them as calls.
-            self._user_functions |= parser._user_functions
+            return V.NULL
 
+    def exec_file(self, path: str) -> Optional[V.Value]:
+        with open(path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+        self.context.cwd = None
+        return self.exec(source, path=path)
+
+    # -- helpers ---------------------------------------------------------
     def get(self, name: str) -> Optional[V.Value]:
-        return self.context.scope.get(name)
+        return self.context.syms.get(name)
 
     def set(self, name: str, value: V.Value) -> None:
         self.context.set(name, value)
 
 
-def run(source: str) -> Optional[V.Value]:
-    """Run Arturo source code with a fresh interpreter."""
-    return Interpreter().exec(source)
+def run(source: str, out: Optional[TextIO] = None) -> Optional[V.Value]:
+    """Run Arturo source with a fresh interpreter."""
+    return Interpreter(out=out).exec(source)
 
 
-def eval_(source: str) -> Optional[V.Value]:
-    return run(source)
+def eval_(source: str, out: Optional[TextIO] = None):
+    return run(source, out=out)
 
 
-# Backwards-compat alias (some tests import ``eval``).
 eval = eval_
