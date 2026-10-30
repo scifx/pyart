@@ -1,1 +1,0 @@
-"""arturo_mini package."""
