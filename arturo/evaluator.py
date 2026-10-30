@@ -194,6 +194,9 @@ class Evaluator:
             name = node.value.data
             return self.ctx.get(name)
         if kind == "store":
+            fast = node.fast
+            if fast is not None and not self.ctx.unscoped:
+                return fast(self)
             value = self._eval_children_first(node)
             if value is V.VOID:
                 return value
@@ -210,13 +213,21 @@ class Evaluator:
             self.ctx.push_attr(node.value.data, value)
             return V.NULL
         if kind == "call":
+            fast = node.fast
+            if fast is not None and not self.ctx.unscoped:
+                result = fast(self)
+                if result is not None:
+                    return result
             return self._eval_call(node)
         if kind == "root":
             result: V.Value = V.VOID
             for child in node.children:
                 collector = self.ctx.collectors[-1] if self.ctx.collectors else None
                 before = len(collector) if collector is not None else 0
-                value = self.eval_node(child)
+                fast = child.fast
+                value = fast(self) if (fast is not None and not self.ctx.unscoped) else self.eval_node(child)
+                if value is None:
+                    value = self.eval_node(child)
                 if value is not V.VOID:
                     result = value
                     self.ctx.last_pushed = value

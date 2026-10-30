@@ -31,7 +31,7 @@ class Node:
     """A node of the generated tree."""
 
     __slots__ = ("kind", "children", "parent", "params", "arity", "value", "name",
-                 "cache")
+                 "cache", "fast")
 
     def __init__(self, kind: str, arity: int = -1, value=None, name: str = ""):
         self.kind = kind
@@ -39,6 +39,7 @@ class Node:
         self.parent: Optional["Node"] = None
         self.params = 0
         self.cache = None
+        self.fast = None
         self.arity = arity
         self.value = value
         self.name = name
@@ -110,6 +111,7 @@ class AstBuilder:
     def build(self, block: V.Block, as_function: bool = False) -> Node:
         root = Node("root", -1)
         self._process_block(root, block)
+        _compile_node(root)
         return root
 
     @staticmethod
@@ -471,6 +473,85 @@ class AstBuilder:
             return
         for child in node.children:
             self._collect_arities(child)
+
+
+# ---------------------------------------------------------------------------
+# Fast paths: simple subtrees are compiled into plain Python closures
+# ---------------------------------------------------------------------------
+_SLOW_CALLS = {"else", "case", "when?", "do", "loop", "map", "select", "filter",
+               "while", "until", "times", "return", "break", "continue", "ensure"}
+
+
+def _compile_node(node) -> None:
+    """Attach a compiled closure to simple nodes (no attributes/pipes)."""
+    for child in node.children:
+        _compile_node(child)
+    kind = node.kind
+    if kind == "constant":
+        value = node.value
+        node.fast = lambda ev, _v=value: _v
+        return
+    if kind == "variable":
+        name = node.value.data
+
+        def _var(ev, _name=name):
+            value = ev.ctx.syms.get(_name)
+            if value is None:
+                return ev.ctx.get(_name)
+            return value
+
+        node.fast = _var
+        return
+    if kind == "call":
+        if node.name in _SLOW_CALLS:
+            return
+        parts = []
+        for child in node.children:
+            if child.fast is None:
+                return
+            parts.append(child.fast)
+        name = node.name
+
+        def _call(ev, _parts=parts, _name=name, _node=node):
+            ctx = ev.ctx
+            fn = ctx.syms.get(_name)
+            if fn is None or not isinstance(fn, V.Function):
+                fn = _node.cache
+                if fn is None:
+                    fn = ev._resolve_callable(_name)
+                    _node.cache = fn
+            args = [part(ev) for part in _parts]
+            impl = fn.impl
+            if impl is not None:
+                result = impl(ev, args)
+            else:
+                result = ev._call_user(fn, args, _name)
+            if result is not V.VOID:
+                ctx.last_pushed = result
+            return result
+
+        node.fast = _call
+        return
+    if kind == "store":
+        if len(node.children) != 1:
+            return
+        child = node.children[-1]
+        if child.fast is None:
+            return
+        name = node.value.data
+        thaw_kinds = ("string", "block", "inline", "dictionary", "object")
+
+        def _store(ev, _child=child.fast, _name=name, _kinds=thaw_kinds):
+            value = _child(ev)
+            if value is V.VOID:
+                return value
+            if getattr(value, "frozen", False) and value.kind in _kinds:
+                value = V.copy_value(value, deep=False)
+            ev.ctx.set(_name, value)
+            return value
+
+        node.fast = _store
+        return
 
 
 def build(block: V.Block, library, syms=None) -> Node:

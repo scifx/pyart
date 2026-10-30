@@ -426,22 +426,26 @@ def _truth3(v):
 
 @impl("and?")
 def _and_q(ev, args):
-    values = [_truth3(v) for v in _lazy_bool(ev, args)]
-    if any(v is False for v in values):
-        return V.Logical(False)
-    if any(v == "maybe" for v in values):
-        return V.Logical("maybe")
-    return V.Logical(True)
+    maybe = False
+    for arg in args:
+        value = _truth3(ev.do_block(arg) if isinstance(arg, V.Block) else arg)
+        if value is False:
+            return V.Logical(False)
+        if value == "maybe":
+            maybe = True
+    return V.Logical("maybe") if maybe else V.Logical(True)
 
 
 @impl("or?")
 def _or_q(ev, args):
-    values = [_truth3(v) for v in _lazy_bool(ev, args)]
-    if any(v is True for v in values):
-        return V.Logical(True)
-    if any(v == "maybe" for v in values):
-        return V.Logical("maybe")
-    return V.Logical(False)
+    maybe = False
+    for arg in args:
+        value = _truth3(ev.do_block(arg) if isinstance(arg, V.Block) else arg)
+        if value is True:
+            return V.Logical(True)
+        if value == "maybe":
+            maybe = True
+    return V.Logical("maybe") if maybe else V.Logical(False)
 
 
 @impl("not?")
