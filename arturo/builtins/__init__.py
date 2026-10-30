@@ -235,7 +235,7 @@ _TYPE_ORDER = {
 }
 
 
-def compare(a: V.Value, b: V.Value, sensitive: bool = False) -> int:
+def compare(a: V.Value, b: V.Value, sensitive: bool = True) -> int:
     """Arturo's total ordering, used by ``<``/``>``/``sort``."""
     if is_num(a) and is_num(b):
         x, y = to_number(a), to_number(b)

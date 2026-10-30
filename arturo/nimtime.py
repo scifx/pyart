@@ -283,6 +283,7 @@ def as_datetime(value) -> Optional[_dt.datetime]:
 
 
 _FIELDS = {
+    "days": lambda d: int(d.strftime("%j")) - 1,   # 0-based day of the year
     "year": lambda d: d.year,
     "month": lambda d: d.month,
     "day": lambda d: d.day,

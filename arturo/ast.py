@@ -23,6 +23,9 @@ from typing import Dict, List, Optional
 from . import values as V
 from .parser import INFIX_ALIASES, PREFIX_ALIASES, STRUCTURAL
 
+# infix aliases registered at runtime via ``alias.infix``
+DYNAMIC_INFIX: dict = {}
+
 
 class Node:
     """A node of the generated tree."""
@@ -120,7 +123,7 @@ class AstBuilder:
 
     def _is_infix_symbol(self, value: V.Value) -> bool:
         return (isinstance(value, V.Symbol)
-                and value.data in INFIX_ALIASES
+                and (value.data in INFIX_ALIASES or value.data in DYNAMIC_INFIX)
                 and value.data not in ("->", "=>", "|"))
 
     def _rewind(self, target: Node, optimize: bool = False) -> Node:
@@ -150,7 +153,7 @@ class AstBuilder:
         if self.i < self.n - 1:
             nxt = self.block.data[self.i + 1]
             if self._is_infix_symbol(nxt):
-                alias = INFIX_ALIASES[nxt.data]
+                alias = DYNAMIC_INFIX.get(nxt.data) or INFIX_ALIASES[nxt.data]
                 self.i += 1
                 if self.arrow_blocks:
                     self.arrow_blocks[-1].append(nxt)

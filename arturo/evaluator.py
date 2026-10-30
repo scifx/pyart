@@ -332,6 +332,8 @@ class Evaluator:
 
         prev_this = self.ctx.this_obj
         try:
+            for key, value in getattr(fn, "imports", {}).items():
+                self.ctx.set(key, value)
             for param, arg in zip(params, args):
                 self.ctx.set(param_name(param), arg)
             try:

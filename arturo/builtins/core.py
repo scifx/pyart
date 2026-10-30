@@ -578,7 +578,8 @@ def _convert_one(ev, name: str, value: V.Value) -> V.Value:
             return V.String(nimtime.format(value.data, fmt.data))
         if fmt is not None and is_num(value):
             pattern = fmt.data
-            if "%" not in pattern and _re.match(r"^[-+ 0#]*\d*[dxXobfeEgGsc]$", pattern):
+            if "%" not in pattern and _re.match(
+                    r"^[-+ 0#]*\d*(\.\d+)?[dxXobfeEgGsc]$", pattern):
                 pattern = "%" + pattern
             try:
                 number = to_number(value)
@@ -913,6 +914,17 @@ def _dictionary(ev, args):
         return value
     if not isinstance(value, V.Block):
         fail("cannot convert to dictionary", "Type Error")
+    if attr_true(ev, "raw"):
+        raw = V.Dictionary({})
+        items = value.data
+        index = 0
+        while index + 1 < len(items):
+            key = items[index]
+            name = key.data if isinstance(key, (V.Word, V.Literal, V.String,
+                                                V.Label, V.Symbol)) else V.to_string(key)
+            raw.data[name] = items[index + 1]
+            index += 2
+        return raw
     result = V.Dictionary({})
     items = value.data
     i = 0
@@ -1138,7 +1150,12 @@ def _until(ev, args):
 
 @impl("do")
 def _do(ev, args):
-    return ev.do_block_unscoped(args[0])
+    value = args[0]
+    if value.kind == "string":
+        from ..parser import Parser
+
+        value = V.Block(Parser(value.data).parse())
+    return ev.do_block_unscoped(value)
 
 
 @impl("loop")
@@ -1328,6 +1345,19 @@ def make_function(ev, params_block, body_block, name="<closure>"):
     exports = attr(ev, "export", None)
     if exports is not None:
         fn.exports = exports if isinstance(exports, V.Block) else V.Block([exports])
+    imports = attr(ev, "import", None)
+    if imports is not None:
+        captured = {}
+        items = imports.data if isinstance(imports, V.Block) else [imports]
+        for item in items:
+            key = item.data if isinstance(item, (V.Literal, V.Word)) else V.to_string(item)
+            if key in ev.ctx.syms:
+                captured[key] = ev.ctx.syms[key]
+            else:
+                lib_fn = ev.ctx.library.lookup(key)
+                if lib_fn is not None:
+                    captured[key] = lib_fn
+        fn.imports = captured
     if attr_true(ev, "memoize"):
         fn.memoize = True
     if attr_true(ev, "pure"):
@@ -1391,8 +1421,25 @@ def _alias(ev, args):
     target_name = target.data if isinstance(target, (V.Literal, V.Word)) else V.to_string(target)
     fn = ev.ctx.library.lookup(target_name)
     if fn is None:
+        candidate = ev.ctx.syms.get(target_name)
+        if isinstance(candidate, V.Function):
+            fn = candidate
+    if fn is None:
         fail(f"function not found: {target_name}", "Name Error")
-    ev.ctx.library.register(V.to_string(name), fn.arity, fn.impl, attrs=fn.attrs)
+    names = []
+    if isinstance(name, V.Block):
+        names = [V.to_string(x) for x in name.data]
+    else:
+        names = [V.to_string(name)]
+    for alias_name in names:
+        if attr_true(ev, "infix"):
+            from .. import ast as A
+
+            A.DYNAMIC_INFIX[alias_name] = target_name
+        elif attr_true(ev, "prefix"):
+            ev.ctx.library.register(alias_name, fn.arity, fn.impl, attrs=fn.attrs)
+        else:
+            ev.ctx.library.register(alias_name, fn.arity, fn.impl, attrs=fn.attrs)
     return VOID
 
 

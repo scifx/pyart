@@ -105,7 +105,13 @@ def iter_values(ev, collection: V.Value, nparams: int = 1) -> List[V.Value]:
     if k == "range":
         return IntSeq(range_values(collection))
     if k in ("block", "inline"):
-        return list(collection.data)
+        items = list(collection.data)
+        if nparams >= 2 and items and not any(
+                isinstance(x, V.Block) for x in items):
+            # ``loop [1 2 3 4] [a b][...]`` consumes the flat items in pairs
+            return [V.Block(items[i:i + nparams])
+                    for i in range(0, len(items), nparams)]
+        return items
     if k == "integer":
         return [V.Integer(i) for i in range(1, collection.data + 1)]
     if k == "string":

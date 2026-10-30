@@ -292,9 +292,17 @@ class Parser:
         ln = self.line
 
         if ch == '"':
-            return V.String(self._parse_string())
+            text = self._parse_string()
+            if self._ch() == ":":
+                self._adv()
+                return V.Label(text)
+            return V.String(text)
         if ch == "{":
-            return self._parse_curly()
+            value = self._parse_curly()
+            if self._ch() == ":" and value.kind == "string":
+                self._adv()
+                return V.Label(value.data)
+            return value
         if ch == "'":
             return self._parse_tick(level)
         if ch == "`":
@@ -446,7 +454,7 @@ class Parser:
                         self.pos = initial
                         text = self._parse_string(stopper="'")
                         return V.Char(text)
-                    return V.Symbol(sym.data)
+                    return V.Literal(sym.data)
             self.pos = initial
             text = self._parse_string(stopper="'")
             return V.Char(text)
