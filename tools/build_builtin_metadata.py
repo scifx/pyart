@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Extract Arturo builtin documentation from an Arturo-Future source checkout.
+"""Extract Arturo builtin documentation from a pinned Arturo source checkout.
 
-Use the source revision pinned by the language skill (933420d):
+For the source currently audited in docs/ARTURO_PORT_PLAN.md:
 
-    python3 tools/build_builtin_metadata.py /path/to/Arturo-Future/src/library
+    python3 tools/build_builtin_metadata.py /path/to/arturo/src/library
 
 The generated snapshot is checked in, so the Python runtime itself does not
 need the upstream source or network access.
@@ -17,7 +17,8 @@ import sys
 import textwrap
 from pathlib import Path
 
-SOURCE_REVISION = "933420d"
+SOURCE_REVISION = "4e549e105c54af2e250381d578474b9064d9d4d2"
+SOURCE_REPOSITORY = "arturo-lang/arturo"
 DECL = re.compile(r'(?m)^\s*builtin\s+"([^"]+)"\s*,')
 TYPE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\??")
 
@@ -149,7 +150,7 @@ def parse_module(path: Path) -> dict:
             "returns": parse_returns(chunk),
             "examples": parse_example(chunk),
             "line": line,
-            "source": ("https://github.com/scifx/Arturo-Future/blob/"
+            "source": (f"https://github.com/{SOURCE_REPOSITORY}/blob/"
                        f"{SOURCE_REVISION}/src/library/{path.name}#L{line}"),
             "source_revision": SOURCE_REVISION,
         }

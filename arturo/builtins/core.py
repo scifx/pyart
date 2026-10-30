@@ -519,13 +519,15 @@ def _info(ev, args):
 
 @builtin("arity", arity=0)
 def _arity_table(ev, args):
-    """``arity`` => dictionary mapping every known name to its arity."""
-    lib = ev.ctx.library
+    """Return the arities of all currently bound builtin and user functions."""
     out = {}
-    for name in lib.names():
-        fn = lib.lookup(name)
-        if fn is not None:
-            out[name] = V.Integer(getattr(fn, "arity", -1))
+    for name in ev.ctx.library.names():
+        fn = ev.ctx.library.lookup(name)
+        if isinstance(fn, V.Function):
+            out[name] = V.Integer(fn.arity)
+    for name, value in ev.ctx.syms.items():
+        if isinstance(value, V.Function):
+            out[name] = V.Integer(value.arity)
     return V.Dictionary(out)
 
 
@@ -541,27 +543,43 @@ def _xnor_q(ev, args):
 
 @builtin("inspect", arity=1, attrs=["muted", "compact", "index"])
 def _inspect(ev, args):
-    return V.String(_inspect_str(args[0]))
+    # Arturo's inspect is an output operation and returns nothing. The muted
+    # flag only controls terminal colouring; this port's printer is plain text.
+    compact = attr(ev, "compact", None) is not None
+    indexed = attr(ev, "index", None) is not None
+    attr(ev, "muted", None)
+    write_out(ev, _inspect_str(args[0], compact=compact, indexed=indexed) + "\n")
+    return VOID
 
 
-def _inspect_str(value: V.Value, level: int = 0) -> str:
+def _inspect_str(value: V.Value, level: int = 0, compact: bool = False,
+                 indexed: bool = False) -> str:
     pad = "    " * level
     k = value.kind
     if k == "block":
         if not value.data:
-            return "[] :block"
-        inner = "\n".join(pad + "    " + _inspect_str(v, level + 1)
-                           for v in value.data)
+            return "[]" if compact else "[] :block"
+        items = []
+        for index, item in enumerate(value.data):
+            prefix = f"[{index}] " if indexed else ""
+            items.append(prefix + _inspect_str(item, level + 1, compact, indexed))
+        if compact:
+            return "[" + " ".join(items) + "]"
+        inner = "\n".join(pad + "    " + item for item in items)
         return "[ :block\n" + inner + "\n" + pad + "]"
     if k == "dictionary":
         if not value.data:
             return "#[]"
+        if compact:
+            return "#[" + " ".join(f"{key}:{_inspect_str(val, level + 1, True, indexed)}"
+                                    for key, val in value.data.items()) + "]"
         inner = "\n".join(f"{'   ' * (level + 1)}{key}: {_inspect_str(val, level + 1)}"
                           for key, val in value.data.items())
         return "#[\n" + inner + "\n" + pad + "]"
     if k == "function":
-        return f"<function {value.name}>"
-    return f"{V.to_string(value)} :{_type_name(value)}"
+        return f"<function {value.name}>" if compact else f"<function {value.name}> :function"
+    text = V.to_string(value)
+    return text if compact else f"{text} :{_type_name(value)}"
 
 
 @builtin("input", arity=1)
@@ -856,9 +874,14 @@ def _build_object(ev, name: str, spec: dict, value: V.Value) -> V.Value:
         # initializer method?
         init = (spec.get("methods") or {}).get("init")
         if isinstance(init, V.Function):
-            ev.call(init, list(items))
             for key in fields:
-                obj.data[key] = ev.ctx.get(key, V.NULL)
+                obj.data[key] = V.NULL
+            previous_this = ev.ctx.this_obj
+            ev.ctx.this_obj = obj
+            try:
+                ev.call(init, list(items), name="init")
+            finally:
+                ev.ctx.this_obj = previous_this
             return obj
         for i, field in enumerate(fields):
             obj.data[field] = items[i] if i < len(items) else V.NULL
@@ -1677,22 +1700,45 @@ def _attrs(ev, args):
 def _attr_q(ev, args):
     name = args[0]
     key = name.data if isinstance(name, (V.Literal, V.Word)) else V.to_string(name)
-    return V.Logical(ev.ctx.pop_attr(key, V.VOID) is not V.VOID)
+    # Unlike attr, the predicate is observational: checking must not consume
+    # the pending attribute, so subsequent attr/attrs calls can still read it.
+    return V.Logical(ev.ctx.has_attr(key))
 
 
 @builtin("symbols", arity=0)
 def _symbols(ev, args):
+    # Arturo's symbol table includes callable library entries as well as local
+    # bindings, but hides internal/uppercase names from this user-facing view.
     result = V.Dictionary({})
     for name in ev.ctx.library.names():
-        result.data[name] = V.NULL
+        if name and name[0].islower():
+            value = ev.ctx.library.lookup(name)
+            if value is not None:
+                result.data[name] = value
     for name, value in ev.ctx.syms.items():
-        result.data[name] = value
+        if name and name[0].islower():
+            result.data[name] = value
     return result
 
 
 @impl("stack")
 def _stack(ev, args):
-    return V.Block([])
+    return V.Block(list(ev.ctx.value_stack))
+
+
+@impl("benchmark")
+def _benchmark(ev, args):
+    import time
+
+    get_mode = ev.ctx.has_attr("get")
+    ev.ctx.pop_attr("get", None)
+    started = time.perf_counter_ns()
+    ev.do_block_unscoped(args[0])
+    elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+    if get_mode:
+        return V.Quantity(V.Floating(elapsed_ms), "ms")
+    write_out(ev, f"[benchmark] time: {elapsed_ms:.3f}ms\n")
+    return VOID
 
 
 @builtin("env", arity=0)

@@ -17,8 +17,8 @@ Hello world!
 | | |
 | --- | --- |
 | Example benchmark | **338 / 338 (100 %)** of the examples the reference runtime passes (`--jobs 2 --timeout 60`) |
-| Language tests | **101 / 101** (`tests/test_language.py`; current additions are covered by local regression checks) |
-| Builtin library | **340 implemented** of 551 registered names (211 still stubs, see [`docs/BUILTIN_STATUS.md`](docs/BUILTIN_STATUS.md)) |
+| Language tests | **103 / 103** (`tests/test_language.py`; current additions are covered by local regression checks) |
+| Builtin library | **345 implemented** of 551 registered names (206 still stubs, see [`docs/BUILTIN_STATUS.md`](docs/BUILTIN_STATUS.md)) |
 | Code size | ~9.3k lines of Python |
 | Main remaining blocker | interpreter **speed** (a few compute-heavy examples need 20–50 s) |
 
@@ -26,18 +26,22 @@ Hello world!
 
 ## Current progress (2026-10-30)
 
-Current work restores source-backed `info` metadata, typed user-function parameters and
-`;;` documentation, and implements `pause` and `methods`; it also fixes `do.times` and
-Arturo's documented colon-form quantity literals (`2:s`). The local language suite is
-**101/101**, and the latest reference-pass benchmark is **338/338 (100%)** with a
-60-second per-example timeout. The inventory is **340 implemented / 211 pending**. Stage details and known gaps are tracked in [`docs/PROGRESS.md`](docs/PROGRESS.md).
+Current work compares every upstream library module at Arturo revision
+`4e549e105c54af2e250381d578474b9064d9d4d2`; all modules except `Ui.nim` are in scope.
+The audit lists 395 non-UI builtin declarations and 398 source example blocks, with a
+module-by-module dependency order in [`docs/ARTURO_PORT_PLAN.md`](docs/ARTURO_PORT_PLAN.md).
+Pyart has matching registered implementations for 316/395 declarations by name; this is
+not yet semantic or example parity. The local suite is **103/103**, and the latest full
+reference-pass benchmark is **338/338** with a 60-second timeout. The broader registry
+reports **345 implemented / 206 stubs**; current completed work and explicit acceptance
+gaps are tracked in [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
-`info.get` is backed by a checked-in metadata snapshot extracted from Arturo-Future
-source: argument and attribute types, descriptions, return types, examples, module,
-source line, and source URL. User-defined functions also retain `;;` data comments and
-typed parameters for reflection; typed arguments are checked at call time. `pause`
-accepts integer milliseconds and time quantities. The documented `arg`, `sys`, and
-`set?` helpers are also implemented.
+`info.get` uses a checked-in snapshot from the pinned Arturo source revision. Reflection
+and function metadata are partial, not a claim that the whole Reflection module is done.
+This update fixes non-consuming `attr?`, implements `benchmark` and a runtime value-stack
+view, and begins the host-system batch (`args`, synchronous `execute`, `process`,
+`terminate`, `superuser?`). Async process/task behavior and most other source examples
+remain to be ported and differentially verified.
 
 ---
 
@@ -83,11 +87,12 @@ arguments (`args`, `script`).
 | `arturo/nimtime.py` | `std/times` | date pattern handling (`yyyy-MM-dd`, `dddd`, …) |
 | `arturo/cli.py`, `repl.py` | `src/arturo.nim` | command line entry point and REPL |
 | `tools/inventory.py` | — | regenerates the implemented/stub inventory in `docs/` |
-| `tools/build_builtin_metadata.py` | pinned Arturo-Future source | builds the checked-in source metadata snapshot |
-| `tests/test_language.py` | — | 101 language-level checks |
+| `tools/audit_upstream_library.py` | `src/library/*.nim` | compares source builtin declarations and reports per-module implementation names |
+| `tools/build_builtin_metadata.py` | pinned `arturo-lang/arturo` source | builds the checked-in source metadata snapshot |
+| `tests/test_language.py` | — | 103 language-level checks |
 | `benchmarks/` | — | harness that runs the upstream examples and diffs their output |
 
-### Language semantics that are implemented 1:1
+### Core language semantics covered by the current regression corpus
 
 * **Right-to-left evaluation, no operator precedence** — `2 * 3 + 4` is `14`,
   `(2 * 3) + 4` is `10`.
@@ -128,18 +133,18 @@ Latest full run after the current implementation (`--jobs 2 --timeout 60`,
 
 ```
 passed 338/338 examples (100%)
-plus 44 examples the reference runtime itself cannot run
+plus 42 examples the reference runtime itself cannot run
 ```
 
 All reference-passing examples completed within the 60-second limit. The slowest were:
 
 | example | time |
 | --- | ---: |
-| `perfect numbers` | 32.7 s |
-| `curzon numbers` | 28.5 s |
-| `permutations - derangements` | 18.6 s |
-| `changeable words` | 17.8 s |
-| `abundant odd numbers` | 11.6 s |
+| `perfect numbers` | 32.8 s |
+| `curzon numbers` | 27.5 s |
+| `permutations - derangements` | 20.7 s |
+| `changeable words` | 18.4 s |
+| `abundant odd numbers` | 11.5 s |
 | `truncatable primes` | 10.1 s |
 | `circular primes` | 6.8 s |
 | `ascending primes` | 6.1 s |
@@ -158,34 +163,28 @@ of silently producing wrong results.
 
 | module | implemented |
 | --- | ---: |
-| `core.py` — control flow, logic, conversion, reflection, bitwise | 131 |
+| `core.py` — control flow, logic, conversion, reflection, bitwise | 132 |
 | `numbers.py` — arithmetic, primes, clamps, statistics, random | 58 |
 | `collections.py` — blocks, dictionaries, sets, sorting, paths | 52 |
 | `strings.py` — splitting, padding, formatting, regex, encoding | 32 |
-| `misc.py` — files, paths, JSON, IO, crypto digests, system info | 33 |
+| `misc.py` — files, paths, JSON, IO, crypto digests, system info | 37 |
 | `iterators.py` — `loop`/`map`/`select`/`filter`/`fold`/`combine`/… | 23 |
 | `dates.py` — `now`, `today`, date arithmetic and predicates | 11 |
-| *(declared only — stubs)* | 211 |
+| *(registered but currently stubbed)* | 206 |
 
 **Full list**: [`docs/BUILTIN_STATUS.md`](docs/BUILTIN_STATUS.md) (regenerate with
 `python3 tools/inventory.py --markdown > docs/BUILTIN_STATUS.md`).
 
-### What is *not* implemented yet (211 names)
+### Remaining library gaps (206 registered stubs)
 
-* **Quantity-type predicates (60)** — `length?`, `mass?`, `area?`, `pressure?`,
-  `temperature?`, … These only need a unit-family table, so they are cheap to add.
-* **Translated aliases (42)** — the Chinese keyword set (`如果`, `循环`, `打印`, `映射`,
-  `筛选`, …). Pure aliasing of builtins that already exist.
-* **Everything else (109)** — three groups worth distinguishing:
-  * *cheap reflection / small helpers*: `eval`, `parse`,
-    `hash`, `in`, `units`, `sortable`, `conforms?`, `with`, `iterator`,
-    `entropy?`, `errorKind?`, `hidden?`, `superuser?`.
-  * *OS / filesystem*: `cd`, `execute`, `process`, `permissions`, `rename`, `symlink`,
-    `terminal`, `wait`, `open`/`close`/`seek`/`tell`/`rewind`.
-  * *system-level subsystems* (largest effort): `net` (`serve`, `request`, `download`,
-    `mail`, `socket?`), `ui` (`webview`, `dialog`, `popup`, `alert`, colour helpers),
-    `db` (`database?`, `query`), tasks/fibers (`yield`, `channel`, `terminate`,
-    `cancel`, `send`/`receive`), bytecode (`store`, `peek`, `goto`, `discard`).
+The broader signature registry includes generated predicates and translated aliases in
+addition to the 395 static non-UI source declarations. Use [`docs/BUILTIN_STATUS.md`](docs/BUILTIN_STATUS.md)
+for the exact current stub list and [`docs/ARTURO_PORT_PLAN.md`](docs/ARTURO_PORT_PLAN.md)
+for upstream module/function coverage. Important unfinished areas include unit-family
+predicates and aliases, colors, quantity introspection, filesystem/terminal operations,
+configuration and asynchronous process handling, networking, databases, streams, tasks,
+events and the remaining type/core helpers. `Ui.nim` is the only module intentionally
+excluded from the target scope.
 
 ---
 
@@ -234,7 +233,7 @@ def _clamp(ev, args):
 ## Development workflow
 
 ```console
-$ python3 tests/test_language.py              # 101 language checks (fast)
+$ python3 tests/test_language.py              # 103 language checks (fast)
 $ python3 benchmarks/one.py "bead sort"       # run one example + diff with the .res
 $ python3 tools/inventory.py                  # builtin coverage report
 $ python3 tools/difftest.py --reference /path/to/arturo   # differential smoke test

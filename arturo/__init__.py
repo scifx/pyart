@@ -64,14 +64,18 @@ class Interpreter:
         self.context.path = [path]
         block = _P.parse(source)
         tree = _ast.build(block, self.library, self.context.syms)
+        self.context.value_stack.clear()
         try:
-            return self.evaluator.eval_node(tree)
-        except _E.ReturnSignal as ret:
-            return ret.value
-        except _E.BreakSignal:
-            return V.NULL
-        except _E.ContinueSignal:
-            return V.NULL
+            try:
+                return self.evaluator.eval_node(tree)
+            except _E.ReturnSignal as ret:
+                return ret.value
+            except _E.BreakSignal:
+                return V.NULL
+            except _E.ContinueSignal:
+                return V.NULL
+        finally:
+            self.context.value_stack.clear()
 
     def exec_file(self, path: str) -> Optional[V.Value]:
         with open(path, "r", encoding="utf-8") as fh:

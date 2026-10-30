@@ -13,7 +13,9 @@ Run with::
 from __future__ import annotations
 
 import io
+import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -249,6 +251,62 @@ def test_arg_returns_runtime_argv() -> None:
     assert output.getvalue() == "one two \n"
 
 
+def test_reflection_module_examples() -> None:
+    output = io.StringIO()
+    interp = Interpreter(out=output)
+    interp.exec('1 2 3 "done" print stack')
+    assert output.getvalue() == "1 2 3 done \n"
+
+    output = io.StringIO()
+    Interpreter(out=output).exec(
+        'f: function [x][print attr? "with" print attr "with" x] f.with: 7 1'
+    )
+    assert output.getvalue() == "true\n7\n"
+
+    output = io.StringIO()
+    interp = Interpreter(out=output)
+    interp.exec('benchmark [1 + 2]')
+    assert re.fullmatch(r"\[benchmark\] time: \d+\.\d{3}ms\n", output.getvalue())
+
+    interp = Interpreter(out=io.StringIO())
+    interp.exec("elapsed: benchmark.get [1 + 2]")
+    elapsed = interp.get("elapsed")
+    assert elapsed.kind == "quantity" and elapsed.unit == "ms"
+    assert elapsed.value.kind == "floating" and elapsed.value.data >= 0
+
+    # Exercise the upstream source examples for this module, including the
+    # object initializer/`this` path and the info display/get variants.
+    with open(os.path.join(ROOT, "arturo", "builtin_docs.json"), encoding="utf-8") as fh:
+        docs = json.load(fh)
+    for name, metadata in docs.items():
+        if metadata.get("module") != "Reflection":
+            continue
+        for index, example in enumerate(metadata.get("examples", [])):
+            try:
+                Interpreter(out=io.StringIO()).exec(example)
+            except Exception as exc:  # pragma: no cover - reported below
+                raise AssertionError(f"upstream Reflection example {name}[{index}]: {exc}") from None
+
+
+def test_system_library_examples() -> None:
+    output = io.StringIO()
+    Interpreter(out=output, argv=["-c", "-b", "1", "two", "3"]).exec("print args")
+    assert output.getvalue() == "[c:true b:true values:[1 two 3]]\n"
+
+    interp = Interpreter(out=io.StringIO())
+    interp.exec('result: execute.code "printf hello"')
+    result = interp.get("result")
+    assert result.data["output"].data == "hello"
+    assert result.data["code"].data == 0
+    interp.exec('execute.directly.code "exit 7"')
+
+    proc = Interpreter(out=io.StringIO())
+    proc.exec("details: process")
+    details = proc.get("details")
+    assert details.data["id"].data == os.getpid()
+    assert details.data["memory"].data["occupied"].unit == "B"
+
+
 def main() -> int:
     failed = 0
     for source, expected in ALL_CASES:
@@ -263,10 +321,14 @@ def main() -> int:
         print("✓ typed function rejects an invalid argument type")
         test_arg_returns_runtime_argv()
         print("✓ arg returns runtime argv")
-        total = len(ALL_CASES) + 2
+        test_reflection_module_examples()
+        print("✓ reflection stack, non-consuming attr?, and benchmark")
+        test_system_library_examples()
+        print("✓ command-line parsing and system process APIs")
+        total = len(ALL_CASES) + 4
     except AssertionError as exc:
         failed += 1
-        total = len(ALL_CASES) + 2
+        total = len(ALL_CASES) + 4
         print(f"✗ {exc}")
     print(f"\n{total - failed}/{total} language checks passed")
     return 1 if failed else 0
