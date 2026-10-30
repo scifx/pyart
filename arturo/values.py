@@ -758,9 +758,9 @@ def to_string(v: Value) -> str:
     if k in ("block", "inline"):
         return "[" + " ".join(block_item_str(x) for x in strip_newlines(v.data)) + "]"
     if k == "dictionary":
-        return "[" + " ".join(f"{key}:{to_string(val)}" for key, val in v.data.items()) + "]"
+        return "[" + " ".join(f"{key}:{block_item_str(val)}" for key, val in v.data.items()) + "]"
     if k == "object":
-        return "[" + " ".join(f"{key}:{to_string(val)}" for key, val in v.data.items()) + "]"
+        return "[" + " ".join(f"{key}:{block_item_str(val)}" for key, val in v.data.items()) + "]"
     if k == "range":
         if v.step == 1:
             return f"{v.start}..{v.stop}"

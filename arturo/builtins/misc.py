@@ -196,17 +196,18 @@ def _system(ev, args):
 # ---------------------------------------------------------------------------
 # Crypto / hashing
 # ---------------------------------------------------------------------------
-@builtin("digest", arity=1, attrs=["sha", "md5", "crlf"])
+@builtin("digest", arity=1, attrs=["sha", "sha1", "sha256", "sha512", "md5"])
 def _digest(ev, args):
     value = args[0]
-    if value.kind != "string":
-        fail("digest expects a string", "Type Error")
-    algorithm = "sha256"
-    for name in ("md5", "sha1", "sha256", "sha512"):
+    text = value.data if value.kind == "string" else V.to_string(value)
+    algorithm = "md5"
+    if attr_true(ev, "sha") or attr_true(ev, "sha1"):
+        algorithm = "sha1"
+    for name in ("md5", "sha256", "sha512"):
         if attr_true(ev, name):
             algorithm = name
             break
-    return V.String(hashlib.new(algorithm, value.data.encode()).hexdigest())
+    return V.String(hashlib.new(algorithm, text.encode()).hexdigest())
 
 
 @builtin("crc", arity=1)

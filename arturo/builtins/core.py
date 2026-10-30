@@ -903,30 +903,27 @@ def _dictionary(ev, args):
     if not isinstance(value, V.Block):
         fail("cannot convert to dictionary", "Type Error")
     result = V.Dictionary({})
-    i = 0
     items = value.data
+    i = 0
     while i < len(items):
         item = items[i]
-        if isinstance(item, V.Label):
-            key = item.data
-            if i + 1 < len(items):
-                nxt = items[i + 1]
-                if isinstance(nxt, V.Label):
-                    result.data[key] = V.NULL
-                    i += 1
-                    continue
-                val = nxt
-                if isinstance(val, (V.Block, V.Inline)) and i + 1 == len(items):
-                    val = ev.do_block(val)
-                else:
-                    val = ev.eval_value(_single_expr(val, ev))
-                result.data[key] = val
-                i += 2
-            else:
-                result.data[key] = V.NULL
-                i += 1
-        else:
+        if not isinstance(item, V.Label):
             i += 1
+            continue
+        key = item.data
+        j = i + 1
+        group: List[V.Value] = []
+        while j < len(items) and not isinstance(items[j], V.Label):
+            group.append(items[j])
+            j += 1
+        if not group:
+            result.data[key] = V.NULL
+        elif len(group) == 1 and isinstance(group[0], (V.Block, V.Inline)):
+            # blocks are lazy values: they are *not* executed here
+            result.data[key] = group[0]
+        else:
+            result.data[key] = ev.do_block(V.Block(group))
+        i = j
     return result
 
 

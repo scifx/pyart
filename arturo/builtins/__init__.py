@@ -249,6 +249,8 @@ def compare(a: V.Value, b: V.Value, sensitive: bool = False) -> int:
         return (ka > kb) - (ka < kb)
     k = a.kind
     if k == "string":
+        # Arturo compares the raw text (case-sensitively) unless ``.sensitive``
+        # is explicitly disabled by the caller
         x, y = a.data, b.data
         if not sensitive:
             x, y = x.lower(), y.lower()

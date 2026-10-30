@@ -172,7 +172,13 @@ def _remove(ev, args):
         target.data.pop(key, None)
         result = target
     elif target.kind == "string":
-        result = V.String(target.data.replace(V.to_string(value), "", 1))
+        text = target.data
+        if isinstance(value, V.Block):
+            for item in value.data:
+                text = text.replace(V.to_string(item), "")
+        else:
+            text = text.replace(V.to_string(value), "")
+        result = V.String(text)
     else:
         fail(f"cannot remove from {target.kind}", "Type Error")
 
@@ -445,7 +451,7 @@ def _slice(ev, args):
     if length is None:
         end = len(items)
     else:
-        end = start + to_int(length)
+        end = to_int(length) + 1
     if start < 0:
         start += len(items)
     result = items[start:end]

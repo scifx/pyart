@@ -38,8 +38,10 @@ def _lower(ev, args):
 def _capitalize(ev, args):
     value = args[0]
     text = _str(value)
-    preserve = attr_true(ev, "preserve")
-    result = text[:1].upper() + (text[1:] if preserve else text[1:].lower())
+    # ``capitalize`` upper-cases the first letter of every word and leaves the
+    # rest of the text untouched (unless ``.preserve`` is not given... it is
+    # always untouched in Arturo)
+    result = _re.sub(r"(?<![^\s])\s*\w", lambda m: m.group(0).upper(), text)
     return V.String(result)
 
 
@@ -47,6 +49,10 @@ def _capitalize(ev, args):
 def _strip(ev, args):
     text = _str(args[0])
     which = []
+    if attr_true(ev, "start"):
+        which.append("leading")
+    if attr_true(ev, "end"):
+        which.append("trailing")
     if attr_true(ev, "leading"):
         which.append("leading")
     if attr_true(ev, "trailing"):
