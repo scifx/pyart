@@ -106,11 +106,11 @@ def iter_values(ev, collection: V.Value, nparams: int = 1) -> List[V.Value]:
         return IntSeq(range_values(collection))
     if k in ("block", "inline"):
         items = list(collection.data)
-        if nparams >= 2 and items and not any(
-                isinstance(x, V.Block) for x in items):
-            # ``loop [1 2 3 4] [a b][...]`` consumes the flat items in pairs
+        if nparams >= 2 and items:
+            # ``loop [1 2 3 4] [a b][...]`` consumes the items in groups of
+            # ``nparams``; a trailing partial group is dropped
             return [V.Block(items[i:i + nparams])
-                    for i in range(0, len(items), nparams)]
+                    for i in range(0, len(items) - nparams + 1, nparams)]
         return items
     if k == "integer":
         return [V.Integer(i) for i in range(1, collection.data + 1)]

@@ -169,10 +169,22 @@ def _move_file(ev, args):
 # ---------------------------------------------------------------------------
 @impl("extract")
 def _extract(ev, args):
-    what = args[0]
-    path = _path_of(args[1])
-    key = what.data if isinstance(what, (V.Literal, V.Word)) else V.to_string(what)
-    if key in ("filename", "file"):
+    path = _path_of(args[0])
+    for key in ("extension", "filename", "basename", "directory"):
+        if attr_present(ev, key) is not MISSING:
+            return _extract_part(path, key)
+    return V.Dictionary({
+        "directory": V.String(os.path.dirname(path)),
+        "basename": V.String(os.path.basename(path)),
+        "filename": V.String(os.path.splitext(os.path.basename(path))[0]),
+        "extension": V.String(os.path.splitext(path)[1]),
+    })
+
+
+def _extract_part(path: str, key: str) -> V.Value:
+    if key == "filename":
+        return V.String(os.path.splitext(os.path.basename(path))[0])
+    if key in ("file", "basename"):
         return V.String(os.path.basename(path))
     if key == "directory":
         return V.String(os.path.dirname(path) or ".")
@@ -211,7 +223,7 @@ def _args(ev, args):
 
 @builtin("standalone?", arity=0)
 def _standalone(ev, args):
-    return V.Logical(True)
+    return V.Logical(getattr(ev.ctx, "standalone", True))
 
 
 @builtin("exit", arity=0)

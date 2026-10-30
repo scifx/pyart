@@ -254,9 +254,47 @@ def _ends_with(ev, args):
     return _suffix_q(ev, args)
 
 
-@builtin("levenshtein", arity=2)
+def _align(a: str, b: str, filler: str = "-"):
+    """Port of Arturo's levenshteinAlign (helpers/strings.nim)."""
+    n, m = len(a), len(b)
+    costs = [[0] * (m + 1) for _ in range(n + 1)]
+    for j in range(m + 1):
+        costs[0][j] = j
+    for i in range(1, n + 1):
+        costs[i][0] = i
+        for j in range(1, m + 1):
+            tmp = costs[i - 1][j - 1] + (0 if a[i - 1] == b[j - 1] else 1)
+            costs[i][j] = min(1 + min(costs[i - 1][j], costs[i][j - 1]), tmp)
+    i, j = n, m
+    ap, bp = [], []
+    while i != 0 and j != 0:
+        tmp = costs[i - 1][j - 1] + (0 if a[i - 1] == b[j - 1] else 1)
+        if costs[i][j] == tmp:
+            i -= 1
+            j -= 1
+            ap.append(a[i])
+            bp.append(b[j])
+        elif costs[i][j] == 1 + costs[i - 1][j]:
+            i -= 1
+            ap.append(a[i])
+            bp.append(filler)
+        elif costs[i][j] == 1 + costs[i][j - 1]:
+            j -= 1
+            ap.append(filler)
+            bp.append(b[j])
+        else:
+            break
+    return "".join(reversed(ap)), "".join(reversed(bp))
+
+
+@builtin("levenshtein", arity=2, attrs=["align", "ins", "del", "sub", "with"])
 def _levenshtein(ev, args):
     a, b = _str(args[0]), _str(args[1])
+    if attr_true(ev, "align"):
+        filler = attr(ev, "with", None)
+        filler = V.to_string(filler) if filler is not None else "-"
+        first, second = _align(a, b, filler)
+        return V.Block([V.String(first), V.String(second)])
     if len(a) < len(b):
         a, b = b, a
     previous = list(range(len(b) + 1))

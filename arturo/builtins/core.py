@@ -577,16 +577,32 @@ def convert(ev, name: str, value: V.Value) -> V.Value:
 def convert_elementwise(ev, types: V.Block, value: V.Value) -> V.Value:
     """`to [:char] "abc"` - convert every element to the given type."""
     names = [t.data if isinstance(t, V.Type) else V.to_string(t) for t in types.data]
+    # attributes (e.g. `.format`) apply to every element, not just the first
+    saved_attrs = list(ev.ctx.attrs)
+
+    def _conv(name, item):
+        ev.ctx.attrs = [a for a in saved_attrs if a[0] == "format"]
+        return convert(ev, name, item)
+
+    def _restore():
+        ev.ctx.attrs = [a for a in saved_attrs if a[0] != "format"]
+
     if value.kind in ("block", "inline"):
         out = []
-        for i, item in enumerate(value.data):
-            out.append(convert(ev, names[min(i, len(names) - 1)], item))
+        try:
+            for i, item in enumerate(value.data):
+                out.append(_conv(names[min(i, len(names) - 1)], item))
+        finally:
+            _restore()
         return V.Block(out)
     if len(names) == 1:
         name = names[0]
         if value.kind in ("string", "range", "dictionary"):
             items = seq_of(value)
-            return V.Block([convert(ev, name, x) for x in items])
+            try:
+                return V.Block([_conv(name, x) for x in items])
+            finally:
+                _restore()
         return convert(ev, name, value)
     return convert(ev, names[0], value)
 
@@ -594,6 +610,14 @@ def convert_elementwise(ev, types: V.Block, value: V.Value) -> V.Value:
 def _convert_one(ev, name: str, value: V.Value) -> V.Value:
     if name == "string":
         fmt = attr(ev, "format", None)
+        if fmt is not None and value.kind == "complex":
+            pattern = fmt.data
+            if not pattern.startswith("%"):
+                pattern = "%" + pattern
+            re_part = pattern % value.data.real
+            im_part = pattern % abs(value.data.imag)
+            sign = "+" if value.data.imag >= 0 else "-"
+            return V.String(f"{re_part}{sign}{im_part}i")
         if fmt is not None and value.kind == "date":
             from .. import nimtime
 
@@ -648,6 +672,21 @@ def _convert_one(ev, name: str, value: V.Value) -> V.Value:
         return V.Rational(Fraction(to_number(value)))
     if name == "logical":
         return V.Logical(V.is_true(value))
+    if name == "complex":
+        if value.kind == "complex":
+            return value
+        if is_num(value):
+            return V.Complex(complex(to_number(value), 0))
+        if value.kind in ("block", "inline"):
+            items = value.data
+            return V.Complex(complex(to_number(items[0]),
+                                     to_number(items[1]) if len(items) > 1 else 0))
+        if value.kind == "string":
+            text = value.data.strip()
+            try:
+                return V.Complex(complex(text.replace("i", "j")))
+            except ValueError:
+                fail(f"cannot convert to :complex", "Conversion Error")
     if name == "char":
         if value.kind == "integer":
             return V.Char(chr(value.data))
@@ -1188,10 +1227,29 @@ def _until(ev, args):
 @impl("do")
 def _do(ev, args):
     value = args[0]
-    if value.kind == "string":
+    if value.kind in ("string", "path"):
+        text = V.to_string(value)
+        import os
+
+        if os.path.isfile(text) and not text.count("\n"):
+            from ..parser import Parser
+            import io
+
+            with open(text, encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+            ev.ctx.path.append(text)
+            saved_standalone = ev.ctx.standalone
+            ev.ctx.standalone = False
+            try:
+                tree = Parser(source).parse()
+                ev.eval_node(ev._tree_for(V.Block(tree)))
+            finally:
+                ev.ctx.standalone = saved_standalone
+                ev.ctx.path.pop()
+            return V.NULL
         from ..parser import Parser
 
-        value = V.Block(Parser(value.data).parse())
+        value = V.Block(Parser(text).parse())
     return ev.do_block_unscoped(value)
 
 

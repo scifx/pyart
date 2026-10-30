@@ -91,6 +91,7 @@ class Context:
         # an enclosing ``@[...]`` block can harvest them
         self.unscoped = False
         self.emitted = False
+        self.standalone = True
         self.depth = 0
         self.cwd = None
 

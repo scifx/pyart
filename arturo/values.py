@@ -808,7 +808,7 @@ def _complex_str(c: complex) -> str:
     real = format_float(c.real)
     imag = format_float(abs(c.imag))
     sign = "+" if c.imag >= 0 else "-"
-    return f"{real} {sign} {imag}i"
+    return f"{real}{sign}{imag}i"
 
 
 def strip_newlines(items: List[Value]) -> List[Value]:
