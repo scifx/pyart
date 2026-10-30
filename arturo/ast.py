@@ -107,6 +107,13 @@ class AstBuilder:
         self._process_block(root, block)
         return root
 
+    @staticmethod
+    def _constant(value: V.Value) -> Node:
+        """Constants are frozen: mutating them copies first (copy-on-write)."""
+        if value.kind in ("block", "inline", "dictionary", "object"):
+            V.freeze(value)
+        return Node("constant", 0, value=value)
+
     # -- helpers ---------------------------------------------------------
     def _arity_of(self, name: str) -> int:
         return self.arities.get(name, -1)
@@ -166,7 +173,7 @@ class AstBuilder:
     def _add_attribute(self, target: Node, val: V.Value, is_label: bool = False) -> Node:
         node = Node("attribute", 1, value=val)
         if not is_label:
-            node.add_child(Node("constant", 0, value=V.TRUE))
+            node.add_child(self._constant(V.TRUE))
         if self.pipe_parent is not None:
             self.pipe_parent.add_child_front(node)
             return self.pipe_parent
@@ -237,7 +244,7 @@ class AstBuilder:
                 for c in sub.children:
                     new_node.add_child(c)
             else:
-                new_node.add_child(Node("constant", 0, value=key))
+                new_node.add_child(self._constant(key))
             base_node = new_node
 
         if is_label:
@@ -270,7 +277,7 @@ class AstBuilder:
             consumed = self._process_block(sub_root, sub, stop_at_statement=True)
             self.block, self.n, self.i = saved
         arrow = V.Block(items[:consumed])
-        node = Node("constant", 0, value=arrow)
+        node = self._constant(arrow)
         target = self._rewind(target)
         target, _ = self._add_potential_infix(target)
         target.add_child(node)
@@ -306,11 +313,11 @@ class AstBuilder:
                         subblock.append(arg)
 
         if len(argblock) == 1:
-            nodes = [Node("constant", 0, value=V.Literal(argblock[0].data)),
-                     Node("constant", 0, value=V.Block(subblock))]
+            nodes = [self._constant(V.Literal(argblock[0].data)),
+                     self._constant(V.Block(subblock))]
         else:
-            nodes = [Node("constant", 0, value=V.Block(argblock)),
-                     Node("constant", 0, value=V.Block(subblock))]
+            nodes = [self._constant(V.Block(argblock)),
+                     self._constant(V.Block(subblock))]
 
         target = self._rewind(target)
         target, _ = self._add_potential_infix(target)
@@ -347,7 +354,7 @@ class AstBuilder:
                     self.pipe_parent = new_call
                     return new_call
         # plain pipe symbol: keep as value
-        return self._add_terminal(target, Node("constant", 0, value=V.Symbol("|")))
+        return self._add_terminal(target, self._constant(V.Symbol("|")))
 
     # -- main loop -------------------------------------------------------
     def _process_block(self, root: Node, block: V.Block, stop_at_statement: bool = False) -> int:
@@ -373,9 +380,9 @@ class AstBuilder:
                 if self.arrow_blocks:
                     self.arrow_blocks[-1].append(item)
                 if item.data == "true":
-                    current = self._add_terminal(current, Node("constant", 0, value=V.TRUE))
+                    current = self._add_terminal(current, self._constant(V.TRUE))
                 elif item.data == "false":
-                    current = self._add_terminal(current, Node("constant", 0, value=V.FALSE))
+                    current = self._add_terminal(current, self._constant(V.FALSE))
                 else:
                     arity = self._arity_of(item.data)
                     if arity != -1:
@@ -407,7 +414,7 @@ class AstBuilder:
                 sym = item.data
                 if sym == "::":
                     rest = V.Block(list(block.data[self.i + 1:]))
-                    current = self._add_terminal(current, Node("constant", 0, value=rest))
+                    current = self._add_terminal(current, self._constant(rest))
                     self.i = self.n
                     consumed = self.n
                     break
@@ -420,13 +427,13 @@ class AstBuilder:
                 elif sym == "!":
                     rest = V.Block(list(block.data[self.i + 1:]))
                     do_node = Node("call", 1, name="do")
-                    do_node.add_child(Node("constant", 0, value=rest))
+                    do_node.add_child(self._constant(rest))
                     current.add_child(do_node)
                     self.i = self.n
                     consumed = self.n
                     break
                 elif sym == "ø":
-                    current = self._add_terminal(current, Node("constant", 0, value=V.NULL))
+                    current = self._add_terminal(current, self._constant(V.NULL))
                 else:
                     if self.arrow_blocks:
                         self.arrow_blocks[-1].append(item)
@@ -436,13 +443,13 @@ class AstBuilder:
                         if arity != -1:
                             current = self._add_call(current, alias, arity)
                         else:
-                            current = self._add_terminal(current, Node("constant", 0, value=item))
+                            current = self._add_terminal(current, self._constant(item))
                     else:
-                        current = self._add_terminal(current, Node("constant", 0, value=item))
+                        current = self._add_terminal(current, self._constant(item))
             else:
                 if self.arrow_blocks:
                     self.arrow_blocks[-1].append(item)
-                current = self._add_terminal(current, Node("constant", 0, value=item))
+                current = self._add_terminal(current, self._constant(item))
 
             self.i += 1
             consumed = self.i

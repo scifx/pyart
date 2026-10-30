@@ -329,12 +329,37 @@ def _set(ev, args):
 # ---------------------------------------------------------------------------
 # searching
 # ---------------------------------------------------------------------------
+def _member_set(collection: V.Block):
+    """Cached set of members for big blocks (membership tests are hot)."""
+    if len(collection.data) < 64:
+        return None
+    cache = getattr(collection, "_member_cache", None)
+    if cache is not None and cache[0] == len(collection.data):
+        return cache[1]
+    try:
+        members = {V.value_key(x) for x in collection.data}
+    except TypeError:  # pragma: no cover - defensive
+        members = None
+    collection._member_cache = (len(collection.data), members)
+    return members
+
+
+def _block_contains(collection: V.Block, value: V.Value) -> bool:
+    members = _member_set(collection)
+    if members is not None:
+        try:
+            return V.value_key(value) in members
+        except TypeError:  # pragma: no cover - defensive
+            pass
+    return any(V.same_value(x, value) for x in collection.data)
+
+
 @impl("contains?")
 def _contains(ev, args):
     collection, value = args
     k = collection.kind
     if k in ("block", "inline"):
-        return V.Logical(any(V.same_value(x, value) for x in collection.data))
+        return V.Logical(_block_contains(collection, value))
     if k == "string":
         return V.Logical(V.to_string(value) in collection.data)
     if k in ("dictionary", "object"):
@@ -361,6 +386,20 @@ def _in(ev, args):
 def _index(ev, args):
     collection, value = args
     items = _items_of(ev, collection)
+    if isinstance(items, list) and len(items) >= 64:
+        try:
+            needle = V.value_key(value)
+            rebuild = getattr(collection, "_index_cache", None)
+            if rebuild is None or rebuild[0] != len(items):
+                table = {}
+                for i, item in enumerate(items):
+                    table.setdefault(V.value_key(item), i)
+                rebuild = (len(items), table)
+                collection._index_cache = rebuild
+            found = rebuild[1].get(needle)
+            return V.Integer(found) if found is not None else V.NULL
+        except TypeError:  # pragma: no cover - defensive
+            pass
     for i, item in enumerate(items):
         if V.same_value(item, value):
             return V.Integer(i)

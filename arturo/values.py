@@ -261,11 +261,32 @@ class Nothing(Value):
 # ---------------------------------------------------------------------------
 # Structural values
 # ---------------------------------------------------------------------------
+def freeze(value: "Value") -> "Value":
+    """Mark a value (and its nested containers) as a frozen literal."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if getattr(item, "frozen", None) is True:
+            continue
+        if item.kind in ("block", "inline", "dictionary", "object"):
+            try:
+                item.frozen = True
+            except AttributeError:  # pragma: no cover - defensive
+                continue
+            if item.kind in ("dictionary", "object"):
+                stack.extend(item.data.values())
+            else:
+                stack.extend(item.data)
+    return value
+
+
 class Block(Value):
     kind = "block"
+    frozen = False
 
     def __init__(self, data=None):
         self.data: List[Value] = list(data) if data is not None else []
+        self.frozen = False
 
     def __len__(self):
         return len(self.data)
@@ -286,9 +307,11 @@ class Inline(Block):
 
 class Dictionary(Value):
     kind = "dictionary"
+    frozen = False
 
     def __init__(self, data=None):
         self.data: Dict[str, Value] = dict(data) if data is not None else OrderedDefault()
+        self.frozen = False
 
     def __hash__(self):
         return hash(("dictionary", tuple((k, _hashable(v)) for k, v in self.data.items())))
@@ -300,10 +323,12 @@ class OrderedDefault(dict):
 
 class Object(Value):
     kind = "object"
+    frozen = False
 
     def __init__(self, proto=None, data=None):
         self.proto = proto
         self.data: Dict[str, Value] = dict(data) if data else {}
+        self.frozen = False
 
     __hash__ = Value.__hash__
 

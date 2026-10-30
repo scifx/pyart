@@ -380,7 +380,7 @@ def register_constants(library) -> None:
         # logic constants
         "true": V.TRUE,
         "false": V.FALSE,
-        "maybe": V.Logical(None),
+        "maybe": V.Logical("maybe"),
         # nil-ish constants
         "null": V.NULL,
         "ø": V.NULL,

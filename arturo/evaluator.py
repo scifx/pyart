@@ -83,6 +83,10 @@ class Context:
         # stack of value collectors: ``@[ loop ... ]`` gathers every value the
         # enclosed loops push (see ``Evaluator.emit``)
         self.collectors: List[List[V.Value]] = []
+        # ``True`` while a block is being executed "unscoped" (Arturo's
+        # ``execUnscoped``): every statement leaves its value on the stack, so
+        # an enclosing ``@[...]`` block can harvest them
+        self.unscoped = False
         self.emitted = False
         self.depth = 0
         self.cwd = None
@@ -178,17 +182,7 @@ class Evaluator:
     def eval_node(self, node) -> V.Value:
         kind = node.kind
         if kind == "constant":
-            value = node.value
-            # Literals in the AST are frozen: every evaluation yields a fresh
-            # (shallow) copy, so that in-place mutation cannot leak into the
-            # next evaluation.
-            if isinstance(value, V.Block):
-                return V.Block(list(value.data))
-            if isinstance(value, V.Inline):
-                return V.Inline(list(value.data))
-            if isinstance(value, V.Dictionary):
-                return V.Dictionary(dict(value.data))
-            return value
+            return node.value
         if kind == "variable":
             name = node.value.data
             return self.ctx.get(name)
@@ -215,7 +209,8 @@ class Evaluator:
                     self.ctx.last_pushed = value
                     # a statement that only ran a collector-aware block has
                     # already contributed its values
-                    if collector is not None and len(collector) == before:
+                    if (collector is not None and self.ctx.unscoped
+                            and len(collector) == before):
                         collector.append(value)
             return result
         raise ArturoError("VM Error", f"Unknown node kind: {kind}")
@@ -241,7 +236,14 @@ class Evaluator:
         args.reverse()
 
         fn = self._resolve_callable(node.name)
-        result = self.call(fn, args, name=node.name)
+        # a call starts a fresh (scoped) evaluation context: value collection
+        # only applies to the statement level of an unscoped block
+        saved_unscoped = self.ctx.unscoped
+        self.ctx.unscoped = False
+        try:
+            result = self.call(fn, args, name=node.name)
+        finally:
+            self.ctx.unscoped = saved_unscoped
         if result is not V.VOID:
             self.ctx.last_pushed = result
         return result
@@ -351,10 +353,20 @@ class Evaluator:
         items: List[V.Value] = []
         self.ctx.collectors.append(items)
         try:
-            self.do_block(block)
+            self.do_block_unscoped(block)
         finally:
             self.ctx.collectors.pop()
         return items
+
+    def do_block_unscoped(self, block: V.Value) -> V.Value:
+        """Evaluate a block the way Arturo's ``execUnscoped`` does: statements
+        leave their values behind instead of discarding them."""
+        saved = self.ctx.unscoped
+        self.ctx.unscoped = True
+        try:
+            return self.do_block(block)
+        finally:
+            self.ctx.unscoped = saved
 
     def do_block(self, block: V.Value, scoped: bool = False) -> V.Value:
         """Evaluate a block (or inline) in the current scope."""

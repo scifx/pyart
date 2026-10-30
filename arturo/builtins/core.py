@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import math
 from fractions import Fraction
-from typing import List
+from typing import Dict, List
 
 from .. import values as V
 from ..evaluator import ArturoError, BreakSignal, ContinueSignal, ReturnSignal
 from . import *
+from . import inplace
 from . import (VOID, attr, attr_true, builtin, collection_size, compare,
                fail, impl, is_num, num_result, print_value, seq_of, to_float,
                to_int, to_number, write_out)
@@ -21,11 +22,7 @@ from . import (VOID, attr, attr_true, builtin, collection_size, compare,
 # ---------------------------------------------------------------------------
 # Arithmetic
 # ---------------------------------------------------------------------------
-def _inplace(ev, arg):
-    """Return (value, setter) when ``arg`` is a literal (in-place target)."""
-    from . import inplace
-
-    return inplace(ev, arg)
+_inplace = inplace
 
 
 def _add_values(a: V.Value, b: V.Value) -> V.Value:
@@ -397,16 +394,31 @@ def _lazy_bool(ev, args):
     return out
 
 
+def _truth3(v):
+    """Three-valued truth: ``True`` / ``False`` / ``"maybe"``."""
+    if v.kind == "logical" and v.data == "maybe":
+        return "maybe"
+    return V.is_true(v)
+
+
 @impl("and?")
 def _and_q(ev, args):
-    values = _lazy_bool(ev, args)
-    return V.Logical(all(V.is_true(v) for v in values))
+    values = [_truth3(v) for v in _lazy_bool(ev, args)]
+    if any(v is False for v in values):
+        return V.Logical(False)
+    if any(v == "maybe" for v in values):
+        return V.Logical("maybe")
+    return V.Logical(True)
 
 
 @impl("or?")
 def _or_q(ev, args):
-    values = _lazy_bool(ev, args)
-    return V.Logical(any(V.is_true(v) for v in values))
+    values = [_truth3(v) for v in _lazy_bool(ev, args)]
+    if any(v is True for v in values):
+        return V.Logical(True)
+    if any(v == "maybe" for v in values):
+        return V.Logical("maybe")
+    return V.Logical(False)
 
 
 @impl("not?")
@@ -414,7 +426,10 @@ def _not_q(ev, args):
     value = args[0]
     if isinstance(value, V.Block):
         value = ev.do_block(value)
-    return V.Logical(not V.is_true(value))
+    truth = _truth3(value)
+    if truth == "maybe":
+        return V.Logical("maybe")
+    return V.Logical(not truth)
 
 
 @impl("coalesce")
@@ -685,7 +700,34 @@ def _convert_one(ev, name: str, value: V.Value) -> V.Value:
         return value
     if name == "string":
         return V.String(V.to_string(value))
+    spec = ev.ctx.library.lookup_type(name)
+    if spec is not None:
+        return _build_object(ev, name, spec, value)
     fail(f"cannot convert to :{name}", "Conversion Error")
+
+
+def _build_object(ev, name: str, spec: dict, value: V.Value) -> V.Value:
+    """Create an instance of a user type from a block/dictionary of values."""
+    fields = spec.get("fields") or []
+    obj = V.Object(proto=V.Type(name))
+    if isinstance(value, V.Dictionary):
+        for key, item in value.data.items():
+            obj.data[key] = item
+    elif isinstance(value, (V.Block, V.Inline)):
+        items = value.data
+        # initializer method?
+        init = (spec.get("methods") or {}).get("init")
+        if isinstance(init, V.Function):
+            ev.call(init, list(items))
+            for key in fields:
+                obj.data[key] = ev.ctx.get(key, V.NULL)
+            return obj
+        for i, field in enumerate(fields):
+            obj.data[field] = items[i] if i < len(items) else V.NULL
+    else:
+        if fields:
+            obj.data[fields[0]] = value
+    return obj
 
 
 
@@ -723,6 +765,39 @@ def _convert(ev, args):
     target, value = args
     name = target.data if isinstance(target, V.Type) else V.to_string(target)
     return convert(ev, name, value)
+
+
+@builtin("define", arity=2)
+def _define(ev, args):
+    """`define :person [name surname]` - register a user type (prototype)."""
+    target, prototype = args
+    name = target.data if isinstance(target, V.Type) else V.to_string(target)
+    fields: List[str] = []
+    methods: Dict[str, V.Value] = {}
+    if isinstance(prototype, V.Block):
+        for item in prototype.data:
+            if isinstance(item, V.Label):
+                fields.append(item.data)
+            elif isinstance(item, (V.Word, V.Literal)):
+                fields.append(item.data)
+            elif isinstance(item, V.Block):
+                for sub in item.data:
+                    if isinstance(sub, V.Label):
+                        fields.append(sub.data)
+            elif isinstance(item, V.Dictionary):
+                for key, value in item.data.items():
+                    fields.append(key)
+                    if isinstance(value, V.Function):
+                        methods[key] = value
+    elif isinstance(prototype, V.Dictionary):
+        for key, value in prototype.data.items():
+            if isinstance(value, V.Function):
+                methods[key] = value
+            else:
+                fields.append(key)
+    ev.ctx.library.register_type(name, {"fields": fields, "methods": methods,
+                                        "prototype": prototype})
+    return V.Type(name)
 
 
 @impl("is")
@@ -771,17 +846,52 @@ def _all_q(ev, args):
     return V.Logical(True)
 
 
+@builtin("xor?", arity=2)
+def _xor_q(ev, args):
+    left, right = _truth3(args[0]), _truth3(args[1])
+    if left == "maybe" or right == "maybe":
+        return V.Logical("maybe")
+    return V.Logical(left != right)
+
+
+@builtin("nand?", arity=2)
+def _nand_q(ev, args):
+    left, right = _truth3(args[0]), _truth3(args[1])
+    if left is False or right is False:
+        return V.Logical(True)
+    if left == "maybe" or right == "maybe":
+        return V.Logical("maybe")
+    return V.Logical(False)
+
+
 @builtin("none?", arity=1)
 def _none_q(ev, args):
     result = _any_q(ev, args)
     return V.Logical(not V.is_true(result))
 
 
-@builtin("array", arity=1)
+def _fill(dims: List[int], value: V.Value, level: int = 0) -> V.Block:
+    if level >= len(dims):
+        return V.copy_value(value)
+    return V.Block([_fill(dims, value, level + 1) for _ in range(dims[level])])
+
+
+@builtin("array", arity=1, attrs=["of"])
 def _array(ev, args):
     value = args[0]
+    of = attr(ev, "of", None)
+    if of is not None:
+        if of.kind in ("block", "inline"):
+            dims = [to_int(x) for x in of.data]
+        else:
+            dims = [to_int(of)]
+        return _fill(dims, value)
     if isinstance(value, V.Block):
         return V.Block(ev.collect_block(value))
+    if value.kind == "range":
+        from .iterators import range_values
+
+        return V.Block([V.Integer(i) for i in range_values(value)])
     return V.Block([value])
 
 
@@ -991,7 +1101,7 @@ def _while(ev, args):
         if count > 5_000_000:
             fail("loop limit exceeded")
         try:
-            result = ev.do_block(body)
+            result = ev.do_block_unscoped(body)
         except BreakSignal:
             break
         except ContinueSignal:
@@ -1008,7 +1118,7 @@ def _until(ev, args):
     result: V.Value = V.NULL
     while True:
         try:
-            result = ev.do_block(body)
+            result = ev.do_block_unscoped(body)
         except BreakSignal:
             break
         except ContinueSignal:
@@ -1020,7 +1130,7 @@ def _until(ev, args):
 
 @impl("do")
 def _do(ev, args):
-    return ev.do_block(args[0])
+    return ev.do_block_unscoped(args[0])
 
 
 @impl("loop")

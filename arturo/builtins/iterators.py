@@ -68,6 +68,33 @@ def param_names(params: V.Value) -> List[str]:
     return []
 
 
+class IntSeq:
+    """Lazy ``list``-like sequence of Integers for ranges (avoids materialising)."""
+
+    __slots__ = ("_range",)
+
+    def __init__(self, rng):
+        self._range = rng
+
+    def __iter__(self):
+        Integer = V.Integer
+        for i in self._range:
+            yield Integer(i)
+
+    def __len__(self):
+        return len(self._range)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [V.Integer(i) for i in self._range[index]]
+        return V.Integer(self._range[index])
+
+    def __reversed__(self):
+        Integer = V.Integer
+        for i in reversed(self._range):
+            yield Integer(i)
+
+
 def iter_values(ev, collection: V.Value, nparams: int = 1) -> List[V.Value]:
     """Expand the iterable into a list of item-values.
 
@@ -76,7 +103,7 @@ def iter_values(ev, collection: V.Value, nparams: int = 1) -> List[V.Value]:
     """
     k = collection.kind
     if k == "range":
-        return [V.Integer(i) for i in range_values(collection)]
+        return IntSeq(range_values(collection))
     if k in ("block", "inline"):
         return list(collection.data)
     if k == "integer":
@@ -158,7 +185,10 @@ def _run(ev, args, mode: str):
             item = items[i]
             _apply_item(ev, names, item, index_name, i)
             try:
-                value = ev.do_block(action)
+                if mode == "loop":
+                    value = ev.do_block_unscoped(action)
+                else:
+                    value = ev.do_block(action)
             except BreakSignal:
                 break
             except ContinueSignal:
@@ -296,7 +326,10 @@ def _arrange(ev, args):
         for i, item in enumerate(items):
             _apply_item(ev, names, item, None, i)
             try:
-                value = ev.do_block(action)
+                if mode == "loop":
+                    value = ev.do_block_unscoped(action)
+                else:
+                    value = ev.do_block(action)
             except BreakSignal:
                 break
             except ContinueSignal:
@@ -317,7 +350,10 @@ def _collect(ev, args):
         for i, item in enumerate(items):
             _apply_item(ev, names, item, None, i)
             try:
-                value = ev.do_block(action)
+                if mode == "loop":
+                    value = ev.do_block_unscoped(action)
+                else:
+                    value = ev.do_block(action)
             except BreakSignal:
                 break
             except ContinueSignal:
