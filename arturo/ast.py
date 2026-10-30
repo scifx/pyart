@@ -482,6 +482,66 @@ _SLOW_CALLS = {"else", "case", "when?", "do", "loop", "map", "select", "filter",
                "while", "until", "times", "return", "break", "continue", "ensure"}
 
 
+def _int_div(x, y):
+    if y == 0:
+        return None
+    q = abs(x) // abs(y)
+    return q if (x >= 0) == (y >= 0) else -q
+
+
+def _int_mod(x, y):
+    if y == 0:
+        return None
+    r = abs(x) % abs(y)
+    return r if x >= 0 else -r
+
+
+def _int_pow(x, y):
+    if y < 0:
+        return None
+    try:
+        return x ** y
+    except (OverflowError, MemoryError):
+        return None
+
+
+# integer / boolean fast operations: (x, y) -> python result, or None to fall
+# back to the generic (slow) implementation
+_INT_SPEC = {
+    "add": lambda x, y: x + y,
+    "sub": lambda x, y: x - y,
+    "mul": lambda x, y: x * y,
+    "div": _int_div,
+    "mod": _int_mod,
+    "pow": _int_pow,
+    "equal?": lambda x, y: x == y,
+    "notEqual?": lambda x, y: x != y,
+    "less?": lambda x, y: x < y,
+    "greater?": lambda x, y: x > y,
+    "lessOrEqual?": lambda x, y: x <= y,
+    "greaterOrEqual?": lambda x, y: x >= y,
+}
+
+
+def _dispatch(ev, node, name, args):
+    """Resolve ``name`` and run it with already-evaluated ``args``."""
+    ctx = ev.ctx
+    fn = ctx.syms.get(name)
+    if fn is None or not isinstance(fn, V.Function):
+        fn = node.cache
+        if fn is None:
+            fn = ev._resolve_callable(name)
+            node.cache = fn
+    impl = fn.impl
+    if impl is not None:
+        result = impl(ev, args)
+    else:
+        result = ev._call_user(fn, args, name)
+    if result is not V.VOID:
+        ctx.last_pushed = result
+    return result
+
+
 def _compile_node(node) -> None:
     """Attach a compiled closure to simple nodes (no attributes/pipes)."""
     for child in node.children:
@@ -512,23 +572,33 @@ def _compile_node(node) -> None:
             parts.append(child.fast)
         name = node.name
 
+        if len(parts) == 2 and name in _INT_SPEC:
+            spec = _INT_SPEC[name]
+
+            def _spec(ev, _p0=parts[0], _p1=parts[1], _spec=spec, _name=name,
+                      _node=node):
+                if ev.ctx.syms.get(_name) is None:
+                    a = _p0(ev)
+                    b = _p1(ev)
+                    if type(a) is V.Integer and type(b) is V.Integer:
+                        x = a.data
+                        y = b.data
+                        out = _spec(x, y)
+                        if out is not None:
+                            if out.__class__ is bool:
+                                return V.Logical(out)
+                            return V.Integer(out)
+                    return _dispatch(ev, _node, _name, [a, b])
+                return _dispatch(ev, _node, _name, [_p0(ev), _p1(ev)])
+
+            node.fast = _spec
+            return
+
         def _call(ev, _parts=parts, _name=name, _node=node):
-            ctx = ev.ctx
-            fn = ctx.syms.get(_name)
-            if fn is None or not isinstance(fn, V.Function):
-                fn = _node.cache
-                if fn is None:
-                    fn = ev._resolve_callable(_name)
-                    _node.cache = fn
-            args = [part(ev) for part in _parts]
-            impl = fn.impl
-            if impl is not None:
-                result = impl(ev, args)
-            else:
-                result = ev._call_user(fn, args, _name)
-            if result is not V.VOID:
-                ctx.last_pushed = result
-            return result
+            args = [part(ev) for part in reversed(_parts)]
+            if len(args) > 1:
+                args.reverse()
+            return _dispatch(ev, _node, _name, args)
 
         node.fast = _call
         return

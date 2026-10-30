@@ -171,21 +171,57 @@ def _divisors(ev, args):
     return V.Block(sorted(result, key=lambda v: v.data))
 
 
+_MR_BASES_SMALL = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+
+
+def _is_prime(n: int) -> bool:
+    """Trial division for small numbers, Miller-Rabin beyond that.
+
+    The reference implementation switches to GMP's ``probablyPrime`` for
+    big integers, so a probabilistic test is exactly what Arturo does.
+    """
+    if n < 2:
+        return False
+    for p in _MR_BASES_SMALL:
+        if n % p == 0:
+            return n == p
+    if n < 1000000 * 1000000:
+        i = 41
+        while i * i <= n:
+            if n % i == 0 or n % (i + 2) == 0:
+                return False
+            i += 6
+        return True
+    # write n-1 as d * 2**s
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    bases = list(_MR_BASES_SMALL)
+    if n >= 3317044064679887385961981:  # deterministic bases are not enough
+        import random
+        rnd = random.Random(0xA47)
+        bases += [rnd.randrange(41, n - 2) for _ in range(20)]
+    for a in bases:
+        a %= n
+        if a < 2:
+            continue
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(s - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
 @impl("prime?")
 def _prime_q(ev, args):
-    n = to_int(args[0])
-    if n < 2:
-        return V.Logical(False)
-    if n % 2 == 0:
-        return V.Logical(n == 2)
-    if n % 3 == 0:
-        return V.Logical(n == 3)
-    i = 5
-    while i * i <= n:
-        if n % i == 0 or n % (i + 2) == 0:
-            return V.Logical(False)
-        i += 6
-    return V.Logical(True)
+    return V.Logical(_is_prime(to_int(args[0])))
 
 
 @impl("digits")

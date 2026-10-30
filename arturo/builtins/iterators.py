@@ -213,6 +213,9 @@ def _run(ev, args, mode: str):
     # hoist the per-iteration work out of the loop: the action block is the
     # same tree for every item
     tree = ev._tree_for(action) if isinstance(action, V.Block) else None
+    body = None
+    if tree is not None and len(tree.children) == 1:
+        body = tree.children[0].fast
     eval_node = ev.eval_node
     ctx = ev.ctx
     single_name = names[0] if len(names) == 1 else None
@@ -231,7 +234,11 @@ def _run(ev, args, mode: str):
             else:
                 _apply_item(ev, names, item, index_name, i)
             try:
-                if tree is not None:
+                if body is not None and mode != "loop":
+                    value = body(ev)
+                    if value is None:
+                        value = eval_node(tree)
+                elif tree is not None:
                     if mode == "loop":
                         saved_unscoped = ctx.unscoped
                         ctx.unscoped = True
@@ -257,7 +264,9 @@ def _run(ev, args, mode: str):
                 if V.is_true(value):
                     results.append(item)
             elif mode == "filter":
-                if V.is_true(value):
+                # Arturo's `filter` *omits* the items that satisfy the
+                # condition (see Iterators.nim: `if isFalse(popped)`)
+                if not V.is_true(value):
                     results.append(item)
             i += 1
 
@@ -383,10 +392,7 @@ def _arrange(ev, args):
         for i, item in enumerate(items):
             _apply_item(ev, names, item, None, i)
             try:
-                if mode == "loop":
-                    value = ev.do_block_unscoped(action)
-                else:
-                    value = ev.do_block(action)
+                value = ev.do_block(action)
             except BreakSignal:
                 break
             except ContinueSignal:
@@ -407,10 +413,7 @@ def _collect(ev, args):
         for i, item in enumerate(items):
             _apply_item(ev, names, item, None, i)
             try:
-                if mode == "loop":
-                    value = ev.do_block_unscoped(action)
-                else:
-                    value = ev.do_block(action)
+                value = ev.do_block(action)
             except BreakSignal:
                 break
             except ContinueSignal:
