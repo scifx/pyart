@@ -83,6 +83,9 @@ class Context:
         # stack of value collectors: ``@[ loop ... ]`` gathers every value the
         # enclosed loops push (see ``Evaluator.emit``)
         self.collectors: List[List[V.Value]] = []
+        # per-frame flag: ``.inline`` functions run in the caller's scope, so
+        # assignments must not be rolled back when the frame is popped
+        self.inline_frames: List[bool] = []
         # ``True`` while a block is being executed "unscoped" (Arturo's
         # ``execUnscoped``): every statement leaves its value on the stack, so
         # an enclosing ``@[...]`` block can harvest them
@@ -113,7 +116,7 @@ class Context:
                 or self.library.constant(name) is not None)
 
     def set(self, name: str, value: V.Value) -> None:
-        if self.frames:
+        if self.frames and not self.inline_frames[-1]:
             frame = self.frames[-1]
             if name not in frame:
                 frame[name] = self.syms.get(name, MISSING)
@@ -127,15 +130,18 @@ class Context:
             del self.syms[name]
 
     # -- scopes ----------------------------------------------------------
-    def push_frame(self, initial: Optional[Dict[str, V.Value]] = None) -> Dict[str, Any]:
+    def push_frame(self, initial: Optional[Dict[str, V.Value]] = None,
+                   inline: bool = False) -> Dict[str, Any]:
         frame: Dict[str, Any] = {}
         self.frames.append(frame)
+        self.inline_frames.append(inline)
         if initial:
             for k, v in initial.items():
                 self.set(k, v)
         return frame
 
     def pop_frame(self) -> None:
+        self.inline_frames.pop()
         frame = self.frames.pop()
         for name, previous in frame.items():
             if previous is MISSING:
@@ -324,11 +330,13 @@ class Evaluator:
             raise ArturoError("Stack Error", "Stack limit exceeded")
 
         params = [p for p in fn.params if not isinstance(p, V.Type)]
-        scoped = not fn.inline
-        if scoped:
-            self.ctx.push_frame()
-        else:
-            self.ctx.push_frame()
+        self.ctx.push_frame(inline=fn.inline)
+        if fn.inline:
+            # only the parameters themselves are scoped
+            frame = self.ctx.frames[-1]
+            for param in params:
+                name = param_name(param)
+                frame.setdefault(name, self.ctx.syms.get(name, MISSING))
 
         prev_this = self.ctx.this_obj
         try:
@@ -341,8 +349,19 @@ class Evaluator:
             except ReturnSignal as ret:
                 result = ret.value
         finally:
+            # ``.export:[x]`` - hand variables back to the caller's scope
+            exported = {}
+            names = getattr(fn, "exports", None)
+            if names is not None:
+                items = names.data if isinstance(names, V.Block) else [names]
+                for item in items:
+                    key = item.data if isinstance(item, (V.Literal, V.Word)) else V.to_string(item)
+                    if key in self.ctx.syms:
+                        exported[key] = self.ctx.syms[key]
             self.ctx.this_obj = prev_this
             self.ctx.pop_frame()
+            for key, value in exported.items():
+                self.ctx.set(key, value)
             self.ctx.depth -= 1
 
         if fn.memoize:

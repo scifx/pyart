@@ -17,9 +17,6 @@ from . import (VOID, attr, attr_true, collection_size, compare, fail, impl,
 # Access helpers (used by the evaluator for `a\b` paths)
 # ---------------------------------------------------------------------------
 def get_value(ev, container: V.Value, key: V.Value) -> V.Value:
-    if isinstance(key, V.Block):
-        # a block path segment is a computed key: ``code\[ch]``
-        key = ev.do_block(key)
     if isinstance(key, V.Char):
         key = V.String(key.data)
     if isinstance(key, (V.Literal, V.Word)):

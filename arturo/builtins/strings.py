@@ -70,15 +70,19 @@ def _pad(ev, args):
     text, width = args[0], args[1]
     s = _str(text)
     n = to_int(width)
+    # every attribute has to be popped, even when we return early: attributes
+    # left on the stack would leak into the next call
     fill = attr(ev, "with", None)
+    center = attr_true(ev, "center")
+    right = attr_true(ev, "right")
     ch = _str(fill) if fill is not None else " "
     if len(s) >= n:
         return V.String(s)
-    if attr_true(ev, "center"):
+    if center:
         total = n - len(s)
         left = total // 2
         return V.String(ch * left + s + ch * (total - left))
-    if attr_true(ev, "right"):
+    if right:
         return V.String(s + ch * (n - len(s)))
     return V.String(ch * (n - len(s)) + s)
 

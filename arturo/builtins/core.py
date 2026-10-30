@@ -1384,9 +1384,11 @@ def _var(ev, args):
     if isinstance(a, V.PathLiteral):
         getter, _ = ev.inplace_target(a)
         return getter()
-    if isinstance(a, V.Word):
+    if isinstance(a, (V.Word, V.String)):
         return ev.ctx.get(a.data)
-    return a
+    if isinstance(a, V.Block):
+        return ev.do_block(a)
+    fail("cannot use value as a literal", "Type Error")
 
 
 def _destructure(ev, target: V.Block, value: V.Value) -> V.Value:
@@ -1408,6 +1410,10 @@ def _let(ev, args):
     if isinstance(target, (V.Literal, V.PathLiteral)):
         _, setter = ev.inplace_target(target)
         setter(value)
+        return value
+    if isinstance(target, V.String):
+        # ``let "name" value`` - define a variable by name
+        ev.ctx.set(target.data, value)
         return value
     if isinstance(target, V.Word):
         ev.ctx.set(target.data, value)
