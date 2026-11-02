@@ -350,17 +350,26 @@ def _set(ev, args):
 # searching
 # ---------------------------------------------------------------------------
 def _member_set(collection: V.Block):
-    """Cached set of members for big blocks (membership tests are hot)."""
-    if len(collection.data) < 64:
+    """Cached set of members for big blocks (membership tests are hot).
+
+    The cache is keyed on the *identity* of the item list plus its length and
+    in-place mutation counter, so replacing elements without changing the
+    length (``b\\0: x``) invalidates it.  Members are keyed with
+    :func:`arturo.values.eq_key`, which follows Arturo's equality rules
+    (``1 = 1.0``), unlike ``value_key``.
+    """
+    data = collection.data
+    if len(data) < 64:
         return None
     cache = getattr(collection, "_member_cache", None)
-    if cache is not None and cache[0] == len(collection.data):
-        return cache[1]
+    if (cache is not None and cache[0] is data and cache[1] == len(data)
+            and cache[2] == getattr(data, "version", None)):
+        return cache[3]
     try:
-        members = {V.value_key(x) for x in collection.data}
-    except TypeError:  # pragma: no cover - defensive
+        members = {V.eq_key(x) for x in data}
+    except TypeError:
         members = None
-    collection._member_cache = (len(collection.data), members)
+    collection._member_cache = (data, len(data), getattr(data, "version", None), members)
     return members
 
 
@@ -368,8 +377,8 @@ def _block_contains(collection: V.Block, value: V.Value) -> bool:
     members = _member_set(collection)
     if members is not None:
         try:
-            return V.value_key(value) in members
-        except TypeError:  # pragma: no cover - defensive
+            return V.eq_key(value) in members
+        except TypeError:
             pass
     return any(V.same_value(x, value) for x in collection.data)
 
@@ -411,21 +420,29 @@ def _index(ev, args):
         needle = V.to_string(value)
         found = collection.data.find(needle)
         return V.Integer(found) if found >= 0 else V.NULL
-    items = _items_of(ev, collection)
-    if isinstance(items, list) and len(items) >= 64:
+    if collection.kind in ("block", "inline") and len(collection.data) >= 64:
+        data = collection.data
         try:
-            needle = V.value_key(value)
-            rebuild = getattr(collection, "_index_cache", None)
-            if rebuild is None or rebuild[0] != len(items):
+            needle = V.eq_key(value)
+        except TypeError:
+            needle = None
+        if needle is not None:
+            cache = getattr(collection, "_index_cache", None)
+            if (cache is None or cache[0] is not data or cache[1] != len(data)
+                    or cache[2] != getattr(data, "version", None)):
                 table = {}
-                for i, item in enumerate(items):
-                    table.setdefault(V.value_key(item), i)
-                rebuild = (len(items), table)
-                collection._index_cache = rebuild
-            found = rebuild[1].get(needle)
-            return V.Integer(found) if found is not None else V.NULL
-        except TypeError:  # pragma: no cover - defensive
-            pass
+                try:
+                    for i, item in enumerate(data):
+                        table.setdefault(V.eq_key(item), i)
+                except TypeError:
+                    table = None
+                cache = (data, len(data), getattr(data, "version", None), table)
+                collection._index_cache = cache
+            table = cache[3]
+            if table is not None:
+                found = table.get(needle)
+                return V.Integer(found) if found is not None else V.NULL
+    items = _items_of(ev, collection)
     for i, item in enumerate(items):
         if V.same_value(item, value):
             return V.Integer(i)
@@ -466,6 +483,16 @@ def _empty(ev, args):
 @impl("slice")
 def _slice(ev, args):
     collection, offset, length = args
+    kind = collection.kind
+    if kind == "string":
+        # characters are code points, so a string slice is a plain str slice
+        data = collection.data
+        start = offset.data if offset.__class__ is V.Integer else to_int(offset)
+        end = len(data) if length is None else (
+            length.data if length.__class__ is V.Integer else to_int(length)) + 1
+        if start < 0:
+            start += len(data)
+        return V.String(data[start:end])
     items = _items_of(ev, collection)
     start = to_int(offset)
     if length is None:
@@ -474,10 +501,7 @@ def _slice(ev, args):
         end = to_int(length) + 1
     if start < 0:
         start += len(items)
-    result = items[start:end]
-    if collection.kind == "string":
-        return V.String("".join(V.to_string(x) for x in result))
-    return V.Block(result)
+    return V.Block(items[start:end])
 
 
 @impl("reverse")
@@ -604,20 +628,20 @@ def _shuffle(ev, args):
 
 @impl("unique")
 def _unique(ev, args):
-    value = args[0]
-    setter = None
-    value, setter = inplace(ev, value)
+    arg = args[0]
+    cls = arg.__class__
+    if cls is not V.Literal and cls is not V.PathLiteral:
+        # a plain argument is never mutated, so skip the defensive copy
+        if arg.kind not in ("block", "inline"):
+            fail("cannot get unique items of non-block", "Type Error")
+        return V.Block(_dedupe(arg.data))
+    value, setter = inplace(ev, arg)
     if value.kind not in ("block", "inline"):
         fail("cannot get unique items of non-block", "Type Error")
-    out: List[V.Value] = []
-    for item in value.data:
-        if not any(V.same_value(item, x) for x in out):
-            out.append(item)
-    value.data[:] = out
-    result = value
+    value.data[:] = _dedupe(value.data)
     if setter:
-        setter(result)
-    return result
+        setter(value)
+    return value
 
 
 @impl("distinct")
@@ -633,17 +657,30 @@ def _flatten(ev, args):
     limit = to_int(depth) if depth is not None else -1
     if attr_true(ev, "once"):
         limit = 1
-    out: List[V.Value] = []
-
-    def walk(items, level):
-        for item in items:
-            if item.kind in ("block", "inline") and (limit < 0 or level < limit):
-                walk(item.data, level + 1)
-            elif not (item.kind in ("block", "inline") and not item.data):
-                out.append(item)
-
-    walk(_items_of(ev, value), 0)
-    return V.Block(out)
+    # Level-by-level expansion: list operations are C-level, so this beats a
+    # Python-level recursive walk over every item.
+    level = list(_items_of(ev, value))
+    depth = 0
+    while True:
+        nxt: List[V.Value] = []
+        extend = nxt.extend
+        append = nxt.append
+        nested = False
+        expand = limit < 0 or depth < limit
+        for item in level:
+            if item.kind == "block" or item.kind == "inline":
+                data = item.data
+                if not data:
+                    continue
+                if expand:
+                    extend(data)
+                    nested = True
+                    continue
+            append(item)
+        if not nested:
+            return V.Block(nxt)
+        level = nxt
+        depth += 1
 
 
 @impl("repeat")
@@ -684,8 +721,30 @@ def _array(ev, args):
 # ---------------------------------------------------------------------------
 # set operations
 # ---------------------------------------------------------------------------
-def _set_of(value: V.Value) -> List[V.Value]:
-    items = value.data if isinstance(value, V.Block) else list(seq_of(value))
+def _key_set(items) -> Optional[set]:
+    """Hashable key set for ``items``, or ``None`` when a value cannot be keyed."""
+    keys = set()
+    try:
+        for item in items:
+            keys.add(V.eq_key(item))
+    except TypeError:
+        return None
+    return keys
+
+
+def _dedupe(items):
+    """Remove duplicates keeping the first occurrence (O(n) for keyable values)."""
+    seen = set()
+    out = []
+    try:
+        for item in items:
+            key = V.eq_key(item)
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+        return out
+    except TypeError:
+        pass
     out: List[V.Value] = []
     for item in items:
         if not any(V.same_value(item, x) for x in out):
@@ -693,19 +752,32 @@ def _set_of(value: V.Value) -> List[V.Value]:
     return out
 
 
+def _set_of(value: V.Value) -> List[V.Value]:
+    items = value.data if isinstance(value, V.Block) else list(seq_of(value))
+    return _dedupe(items)
+
+
 @impl("union")
 def _union(ev, args):
     a, b = _set_of(args[0]), _set_of(args[1])
-    out = list(a)
-    for item in b:
-        if not any(V.same_value(item, x) for x in out):
-            out.append(item)
-    return V.Block(out)
+    return V.Block(_dedupe(list(a) + list(b)))
 
 
 @impl("intersection")
 def _intersection(ev, args):
     a, b = _set_of(args[0]), _set_of(args[1])
+    keys = _key_set(a)
+    if keys is not None:
+        out = []
+        for y in b:
+            try:
+                if V.eq_key(y) in keys:
+                    out.append(y)
+            except TypeError:
+                keys = None
+                break
+        else:
+            return V.Block(out)
     # the result keeps the order of the second collection
     return V.Block([y for y in b if any(V.same_value(y, x) for x in a)])
 
@@ -714,10 +786,28 @@ def _intersection(ev, args):
 def _difference(ev, args):
     a, b = _set_of(args[0]), _set_of(args[1])
     symmetric = attr_true(ev, "symmetric")
-    left = [x for x in a if not any(V.same_value(x, y) for y in b)]
+    keys = _key_set(b)
+    if keys is not None:
+        try:
+            left = [x for x in a if V.eq_key(x) not in keys]
+        except TypeError:
+            left = None
+    else:
+        left = None
+    if left is None:
+        left = [x for x in a if not any(V.same_value(x, y) for y in b)]
     if not symmetric:
         return V.Block(left)
-    right = [y for y in b if not any(V.same_value(y, x) for x in a)]
+    rkeys = _key_set(a)
+    if rkeys is not None:
+        try:
+            right = [y for y in b if V.eq_key(y) not in rkeys]
+        except TypeError:
+            right = None
+    else:
+        right = None
+    if right is None:
+        right = [y for y in b if not any(V.same_value(y, x) for x in a)]
     return V.Block(left + right)
 
 
@@ -734,7 +824,15 @@ def _powerset(ev, args):
 @impl("subset?")
 def _subset(ev, args):
     a, b = _set_of(args[0]), _set_of(args[1])
-    inside = all(any(V.same_value(x, y) for y in b) for x in a)
+    keys = _key_set(b)
+    inside = None
+    if keys is not None:
+        try:
+            inside = all(V.eq_key(x) in keys for x in a)
+        except TypeError:
+            inside = None
+    if inside is None:
+        inside = all(any(V.same_value(x, y) for y in b) for x in a)
     if inside and attr_true(ev, "proper"):
         return V.Logical(len(a) < len(b))
     return V.Logical(inside)

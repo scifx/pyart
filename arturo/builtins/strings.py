@@ -287,6 +287,45 @@ def _align(a: str, b: str, filler: str = "-"):
     return "".join(reversed(ap)), "".join(reversed(bp))
 
 
+def _levenshtein_myers(a: str, b: str) -> int:
+    """Unit-cost edit distance, Myers' bit-parallel algorithm.
+
+    The classic two-row DP costs ``len(a) * len(b)`` Python-level cell updates;
+    this kernel runs ``len(a)`` iterations over big-int bit operations, which
+    is the same answer roughly two orders of magnitude faster.
+    """
+    if len(a) < len(b):
+        a, b = b, a
+    m = len(b)
+    if m == 0:
+        return len(a)
+    # Peq: for every character of the (shorter) pattern, the bitmask of its
+    # positions
+    peq = {}
+    for i, ch in enumerate(b):
+        peq[ch] = peq.get(ch, 0) | (1 << i)
+    full = (1 << m) - 1
+    pv = full           # positive vertical deltas
+    mv = 0              # negative vertical deltas
+    score = m
+    last = 1 << (m - 1)
+    for ch in a:
+        eq = peq.get(ch, 0)
+        xv = eq | mv
+        xh = (((eq & pv) + pv) ^ pv) | eq
+        ph = mv | ~(xh | pv)
+        mh = pv & xh
+        if ph & last:
+            score += 1
+        elif mh & last:
+            score -= 1
+        ph = (ph << 1) | 1
+        mh <<= 1
+        pv = (mh | ~(xv | ph)) & full
+        mv = (ph & xv) & full
+    return score
+
+
 @builtin("levenshtein", arity=2, attrs=["align", "ins", "del", "sub", "with"])
 def _levenshtein(ev, args):
     a, b = _str(args[0]), _str(args[1])
@@ -295,16 +334,7 @@ def _levenshtein(ev, args):
         filler = V.to_string(filler) if filler is not None else "-"
         first, second = _align(a, b, filler)
         return V.Block([V.String(first), V.String(second)])
-    if len(a) < len(b):
-        a, b = b, a
-    previous = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        current = [i]
-        for j, cb in enumerate(b, 1):
-            current.append(min(previous[j] + 1, current[j - 1] + 1,
-                               previous[j - 1] + (ca != cb)))
-        previous = current
-    return V.Integer(previous[-1])
+    return V.Integer(_levenshtein_myers(a, b))
 
 
 @builtin("jaro", arity=2)

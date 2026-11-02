@@ -247,6 +247,8 @@ class Parser:
                     while not self._at_end() and self._ch() != "\n":
                         self._adv()
                     if block is not None:
+                        if not isinstance(block.doc_comments, list):
+                            block.doc_comments = []
                         block.doc_comments.append(self.src[start:self.pos].strip())
                 else:
                     while not self._at_end() and self._ch() != "\n":

@@ -4,14 +4,9 @@ misc.py - files, paths, dates, crypto, system and module support.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import os
-import platform
-import socket
-import subprocess
 import sys
 import time
-import shlex
 from typing import List
 
 from .. import values as V
@@ -311,6 +306,9 @@ def _parse_arg_value(text: str) -> V.Value:
 @builtin("sys", arity=0)
 def _sys(ev, args):
     """Return Python-host system information using Arturo's field names."""
+    import platform
+    import socket
+
     system = platform.system().lower()
     os_name = {"darwin": "macos", "windows": "windows"}.get(system, system)
     built = V.Date(datetime.datetime.now().astimezone())
@@ -345,12 +343,17 @@ def _exit(ev, args):
 
 @builtin("system", arity=0)
 def _system(ev, args):
-    return V.Dictionary({"os": V.String(sys.platform), "arch": V.String(platform.machine() or "unknown")})
+    import platform
+
+    return V.Dictionary({"os": V.String(sys.platform),
+                         "arch": V.String(platform.machine() or "unknown")})
 
 
 @builtin("execute", arity=1, attrs=["args", "async", "code", "directly"])
 def _execute(ev, args):
     """Run an OS command; preserve Arturo's output/code/direct modes."""
+    import shlex
+
     command = V.to_string(args[0])
     raw_args = attr(ev, "args", None)
     async_attr = attr(ev, "async", None)
@@ -362,6 +365,8 @@ def _execute(ev, args):
         command += " " + " ".join(shlex.quote(V.to_string(v)) for v in raw_args.data)
     if async_attr is not None:
         fail("execute.async requires the task runtime, which is not implemented", "Not Implemented")
+    import subprocess
+
     try:
         if directly:
             completed = subprocess.run(command, shell=True, check=False)
@@ -455,6 +460,8 @@ def _absolute_q(ev, args):
 
 @builtin("digest", arity=1, attrs=["sha", "sha1", "sha256", "sha512", "md5"])
 def _digest(ev, args):
+    import hashlib
+
     value = args[0]
     text = value.data if value.kind == "string" else V.to_string(value)
     algorithm = "md5"

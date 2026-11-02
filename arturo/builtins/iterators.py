@@ -194,12 +194,20 @@ def _counter_index(ev, counter) -> Optional[str]:
     return None
 
 
+_MODE_CODE = {"map": 0, "select": 1, "filter": 2}
+
+
 def _run(ev, args, mode: str):
     collection, params, action = args[0], args[1], args[2]
     names = param_names(params)
-    counter = attr(ev, "with", None)
-    index_name = _counter_index(ev, counter)
-    forever = attr_true(ev, "forever")
+    ctx_attrs = ev.ctx.attrs
+    if ctx_attrs:
+        counter = attr(ev, "with", None)
+        index_name = _counter_index(ev, counter)
+        forever = attr_true(ev, "forever")
+    else:
+        index_name = None
+        forever = False
 
     if not isinstance(action, V.Block) and mode != "loop":
         fail("action must be a block", "Type Error")
@@ -218,61 +226,145 @@ def _run(ev, args, mode: str):
         body = tree.children[0].fast
     eval_node = ev.eval_node
     ctx = ev.ctx
+    syms = ctx.syms
     single_name = names[0] if len(names) == 1 else None
-    items_len = len(items)
+    mcode = _MODE_CODE.get(mode, -1)
+    is_true = V.is_true
+    body_uses_stack = mode == "loop" and body is not None and _tree_mentions_stack(tree)
 
-    with protected(ev, protect):
-        i = 0
-        while True:
-            if i >= items_len:
-                if not forever or not items_len:
-                    break
-                i = 0
-            item = items[i]
-            if single_name is not None and index_name is None:
-                ctx.set(single_name, item)
-            else:
-                _apply_item(ev, names, item, index_name, i)
-            try:
-                if body is not None and mode != "loop" and not ctx.unscoped:
+    # ``chdir``-style protection of the iterator parameters, without paying
+    # for a generator-based context manager on every call
+    saved = {}
+    for name in protect:
+        if name not in saved:
+            saved[name] = syms.get(name, MISSING)
+    try:
+        # ---- compiled path: whole loop as one generated function --------
+        if (tree is not None and tree.children and single_name is not None
+                and not forever and not ctx.unscoped
+                and items.__class__ is not InfSeq
+                and (mcode >= 0 or (mode == "loop" and not ctx.collectors
+                                    and not body_uses_stack))):
+            wrap_int = items.__class__ is IntSeq
+            plan = ev.ast_module.iterator_plan(tree, mode, single_name, wrap_int,
+                                               index_name, ev._tree_for)
+            if plan is not None:
+                seq = items._range if wrap_int else items
+                result = plan(ev, seq)
+                return V.Block(result) if mcode >= 0 else result
+
+        # ---- tight path: one statement, one parameter, no index ----------
+        if (body is not None and single_name is not None and index_name is None
+                and not forever and mcode >= 0 and not ctx.unscoped):
+            append = results.append
+            for item in _fast_iter(items):
+                syms[single_name] = item
+                try:
                     value = body(ev)
-                    if value is None:
-                        value = eval_node(tree)
-                elif tree is not None:
-                    if mode == "loop":
-                        saved_unscoped = ctx.unscoped
-                        ctx.unscoped = True
-                        try:
-                            value = eval_node(tree)
-                        finally:
-                            ctx.unscoped = saved_unscoped
-                    else:
-                        value = eval_node(tree)
-                elif mode == "loop":
-                    value = ev.do_block_unscoped(action)
+                except BreakSignal:
+                    break
+                except ContinueSignal:
+                    continue
+                if value is None:
+                    value = eval_node(tree)
+                if mcode == 0:
+                    append(value)
+                elif is_true(value):
+                    if mcode == 1:
+                        append(item)
+                elif mcode == 2:
+                    append(item)
+            if mcode == 0 or mcode == 1 or mcode == 2:
+                return V.Block(results)
+
+        # ---- general path ------------------------------------------------
+        items_len = len(items)
+        loop_body = mode == "loop"
+        outer_unscoped = ctx.unscoped
+        if loop_body:
+            ctx.unscoped = True
+        try:
+            i = 0
+            while True:
+                if i >= items_len:
+                    if not forever or not items_len:
+                        break
+                    i = 0
+                item = items[i]
+                if single_name is not None and index_name is None:
+                    syms[single_name] = item
                 else:
-                    value = ev.do_block(action)
-            except BreakSignal:
-                break
-            except ContinueSignal:
+                    _apply_item(ev, names, item, index_name, i)
+                try:
+                    if body is not None and not loop_body and not ctx.unscoped:
+                        value = body(ev)
+                        if value is None:
+                            value = eval_node(tree)
+                    elif tree is not None:
+                        value = eval_node(tree)
+                    elif loop_body:
+                        value = ev.do_block_unscoped(action)
+                    else:
+                        value = ev.do_block(action)
+                except BreakSignal:
+                    break
+                except ContinueSignal:
+                    i += 1
+                    continue
+                last = value
+                if mcode == 0:
+                    results.append(value)
+                elif mcode == 1:
+                    if is_true(value):
+                        results.append(item)
+                elif mcode == 2:
+                    # Arturo's `filter` *omits* the items that satisfy the
+                    # condition (see Iterators.nim: `if isFalse(popped)`)
+                    if not is_true(value):
+                        results.append(item)
                 i += 1
-                continue
-            last = value
-            if mode == "map":
-                results.append(value)
-            elif mode == "select":
-                if V.is_true(value):
-                    results.append(item)
-            elif mode == "filter":
-                # Arturo's `filter` *omits* the items that satisfy the
-                # condition (see Iterators.nim: `if isFalse(popped)`)
-                if not V.is_true(value):
-                    results.append(item)
-            i += 1
+        finally:
+            ctx.unscoped = outer_unscoped
+    finally:
+        for name, value in saved.items():
+            if value is MISSING:
+                syms.pop(name, None)
+            else:
+                syms[name] = value
 
     if mode == "map" or mode == "select" or mode == "filter":
         return V.Block(results)
     return last
+
+
+def _tree_mentions_stack(tree) -> bool:
+    """Does the loop body read the VM value stack (``stack``/``last``)?"""
+    if tree is None:
+        return False
+    meta = tree.meta
+    cached = meta.get("mentions_stack") if meta is not None else None
+    if cached is not None:
+        return cached
+    pending = [tree]
+    found = False
+    while pending:
+        node = pending.pop()
+        if node.kind == "call" and node.name in ("stack", "last"):
+            found = True
+            break
+        pending.extend(node.children)
+    if meta is not None:
+        meta["mentions_stack"] = found
+    return found
+
+
+def _fast_iter(items):
+    """Iterate item values without a Python-level ``__getitem__`` per element."""
+    if items.__class__ is IntSeq:
+        return map(V.Integer, items._range)
+    if items.__class__ is list:
+        return items
+    return iter(items)
 
 
 def iter_loop(ev, args):
@@ -427,30 +519,51 @@ def _gather(ev, args):
     return _collect(ev, args)
 
 
-@impl("every?")
-def _every(ev, args):
-    collection, params, action = args[0], args[1], args[2]
+def _predicate_iter(ev, collection, params, action, mode: str):
+    """Shared ``every?``/``some?`` loop, compiled when the action allows it."""
     names = param_names(params)
     items = iter_values(ev, collection, len(names) if names else 1)
-    with protected(ev, names):
+    if not isinstance(action, V.Block):
+        return None
+    ctx = ev.ctx
+    tree = ev._tree_for(action)
+    single_name = names[0] if len(names) == 1 else None
+    if (tree.children and single_name is not None
+            and not ctx.collectors and items.__class__ is not InfSeq):
+        wrap_int = items.__class__ is IntSeq
+        plan = ev.ast_module.iterator_plan(tree, mode, single_name, wrap_int, None,
+                                           ev._tree_for)
+        if plan is not None:
+            seq = items._range if wrap_int else items
+            return V.Logical(plan(ev, seq))
+    saved = {}
+    for name in names:
+        saved[name] = ctx.syms.get(name, MISSING)
+    try:
         for i, item in enumerate(items):
             _apply_item(ev, names, item, None, i)
-            if not V.is_true(ev.do_block(action)):
-                return V.Logical(False)
-    return V.Logical(True)
+            truth = V.is_true(ev.do_block(action))
+            if truth == (mode == "some"):
+                return V.Logical(truth)
+    finally:
+        for name, value in saved.items():
+            if value is MISSING:
+                ctx.syms.pop(name, None)
+            else:
+                ctx.syms[name] = value
+    return V.Logical(mode == "every")
+
+
+@impl("every?")
+def _every(ev, args):
+    result = _predicate_iter(ev, args[0], args[1], args[2], "every")
+    return V.Logical(True) if result is None else result
 
 
 @impl("some?")
 def _some(ev, args):
-    collection, params, action = args[0], args[1], args[2]
-    names = param_names(params)
-    items = iter_values(ev, collection, len(names) if names else 1)
-    with protected(ev, names):
-        for i, item in enumerate(items):
-            _apply_item(ev, names, item, None, i)
-            if V.is_true(ev.do_block(action)):
-                return V.Logical(True)
-    return V.Logical(False)
+    result = _predicate_iter(ev, args[0], args[1], args[2], "some")
+    return V.Logical(False) if result is None else result
 
 
 # ---------------------------------------------------------------------------
@@ -562,8 +675,38 @@ def _aggregate(ev, args, fn):
     return fn(items)
 
 
+def _int_items(data):
+    """``data`` as a list of Python ints, or ``None`` when it is not all ints.
+
+    Used by the numeric aggregates to avoid boxing/unboxing every element.
+    """
+    Integer = V.Integer
+    out = []
+    append = out.append
+    for item in data:
+        if item.__class__ is not Integer:
+            return None
+        append(item.data)
+    return out
+
+
 @impl("sum")
 def _sum(ev, args):
+    value = args[0]
+    kind = value.kind
+    if kind == "range":
+        start, stop, step = value.data
+        if not isinstance(start, float) and not isinstance(stop, float):
+            return V.Integer(sum(range_values(value)))
+    elif kind in ("block", "inline"):
+        ints = _int_items(value.data)
+        if ints:
+            return V.Integer(sum(ints))
+    elif kind == "dictionary":
+        ints = _int_items(list(value.data.values()))
+        if ints:
+            return V.Integer(sum(ints))
+
     def total(items):
         acc = items[0]
         for item in items[1:]:
@@ -586,6 +729,22 @@ def _concat(a, b):
 
 @impl("product")
 def _product(ev, args):
+    value = args[0]
+    if value.kind in ("block", "inline"):
+        ints = _int_items(value.data)
+        if ints:
+            result = 1
+            for item in ints:
+                result *= item
+            return V.Integer(result)
+    elif value.kind == "range":
+        start, stop, step = value.data
+        if not isinstance(start, float) and not isinstance(stop, float):
+            result = 1
+            for item in range_values(value):
+                result *= item
+            return V.Integer(result)
+
     def prod(items):
         acc = items[0]
         for item in items[1:]:
@@ -597,6 +756,18 @@ def _product(ev, args):
 
 @impl("average")
 def _average(ev, args):
+    value = args[0]
+    if value.kind in ("block", "inline"):
+        ints = _int_items(value.data)
+        if ints:
+            return num_result(sum(ints) / len(ints))
+    elif value.kind == "range":
+        start, stop, step = value.data
+        if not isinstance(start, float) and not isinstance(stop, float):
+            rng = range_values(value)
+            if len(rng):
+                return num_result(sum(rng) / len(rng))
+
     def mean(items):
         total = 0
         for item in items:
