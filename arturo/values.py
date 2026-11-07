@@ -280,16 +280,84 @@ def freeze(value: "Value") -> "Value":
     return value
 
 
+class BlockData(list):
+    """The item storage of a :class:`Block`.
+
+    A plain ``list`` that bumps a monotonically increasing ``version`` on every
+    in-place modification.  Derived caches (membership tables, index tables,
+    compiled AST trees) key on that version, so an in-place edit - even one
+    that keeps the length unchanged - invalidates them.
+
+    ``version`` is a *class* attribute until the first mutation, so building a
+    ``BlockData`` costs exactly as much as building a ``list``.
+    """
+
+    version = 0
+
+    def __setitem__(self, key, value):
+        list.__setitem__(self, key, value)
+        self.version = self.version + 1
+
+    def __delitem__(self, key):
+        list.__delitem__(self, key)
+        self.version = self.version + 1
+
+    def __iadd__(self, other):
+        result = list.__iadd__(self, other)
+        self.version = self.version + 1
+        return result
+
+    def __imul__(self, other):
+        result = list.__imul__(self, other)
+        self.version = self.version + 1
+        return result
+
+    def append(self, value):
+        list.append(self, value)
+        self.version = self.version + 1
+
+    def extend(self, values):
+        list.extend(self, values)
+        self.version = self.version + 1
+
+    def insert(self, index, value):
+        list.insert(self, index, value)
+        self.version = self.version + 1
+
+    def pop(self, index=-1):
+        value = list.pop(self, index)
+        self.version = self.version + 1
+        return value
+
+    def remove(self, value):
+        list.remove(self, value)
+        self.version = self.version + 1
+
+    def clear(self):
+        list.clear(self)
+        self.version = self.version + 1
+
+    def sort(self, *args, **kwargs):
+        list.sort(self, *args, **kwargs)
+        self.version = self.version + 1
+
+    def reverse(self):
+        list.reverse(self)
+        self.version = self.version + 1
+
+
 class Block(Value):
     kind = "block"
     frozen = False
 
+    # `;;` data comments are attached by the parser to function bodies; they
+    # are documentation, not executable tokens.  Almost every block has none,
+    # so the list is created on first use instead of in the constructor.
+    doc_comments: List[str] = ()
+
     def __init__(self, data=None):
-        self.data: List[Value] = list(data) if data is not None else []
+        self.data: List[Value] = BlockData(data) if data is not None else BlockData()
         self.frozen = False
-        # `;;` data comments are attached by the parser to function bodies;
-        # they are documentation, not executable tokens.
-        self.doc_comments: List[str] = []
 
     def __len__(self):
         return len(self.data)
@@ -494,6 +562,9 @@ class Function(Value):
         self.pure = pure
         self.doc = doc or {}
         self.data = name
+        # cached call plan for the evaluator's compact call path
+        self._fast_plan = None
+        self._fast_plan_done = False
 
     @property
     def is_builtin(self) -> bool:
@@ -573,6 +644,70 @@ def value_key(v: Value):
     if k == "function":
         return ("function", id(v))
     return (k, id(v))
+
+
+_EQ_SCALAR_TAGS = {
+    "logical": "l", "word": "w", "literal": "lt", "label": "lb", "symbol": "sym",
+    "type": "ty", "version": "v", "color": "c", "unit": "u",
+}
+
+
+def eq_key(v: Value):
+    """A hashable key that is *consistent with* :func:`same_value`.
+
+    ``value_key`` is fine for memoisation but it does **not** follow Arturo's
+    equality rules: ``Integer(1)`` and ``Floating(1.0)`` compare equal yet get
+    different keys, and so do a one-character string and a char.  Caches that
+    answer questions like ``contains?``/``index``/``unique`` must use this key
+    instead, or they return answers a linear scan would not.
+
+    Raises :class:`TypeError` for values that cannot be keyed; callers then
+    fall back to a linear ``same_value`` scan.
+    """
+    k = v.kind
+    if k == "integer":
+        return ("n", v.data)
+    if k == "floating":
+        data = v.data
+        if data != data:  # NaN: same_value(nan, nan) is False unless identical
+            return ("nan", id(v))
+        if data in (float("inf"), float("-inf")):
+            return ("ninf", data)
+        return ("n", Fraction(data))
+    if k == "rational":
+        return ("n", v.data)
+    if k == "string" or k == "char":
+        return ("s", v.data)
+    if k in _EQ_SCALAR_TAGS:
+        return (_EQ_SCALAR_TAGS[k], v.data)
+    if k == "null":
+        return ("null",)
+    if k == "nothing":
+        return ("nothing",)
+    if k in ("block", "inline"):
+        return ("blk", tuple(eq_key(x) for x in v.data))
+    if k == "dictionary":
+        return ("dict", tuple(sorted((name, eq_key(val)) for name, val in v.data.items())))
+    if k == "object":
+        return ("obj", tuple(sorted((name, eq_key(val)) for name, val in v.data.items())),
+                None if v.proto is None else eq_key(v.proto))
+    if k == "range":
+        return ("rng",) + tuple(v.data)
+    if k == "binary":
+        return ("bin", v.data)
+    if k == "date":
+        return ("date", v.data)
+    if k == "regex":
+        return ("re", v.data, v.flags)
+    if k == "quantity":
+        return ("q", eq_key(v.value), v.unit)
+    if k in ("path", "pathliteral", "pathlabel"):
+        return (k, tuple(eq_key(x) for x in v.data))
+    if k == "error":
+        return ("err", tuple(sorted((name, eq_key(val)) for name, val in v.data.items())))
+    if k == "function":
+        return ("fn", id(v))
+    raise TypeError(f"cannot key a {k} value")
 
 
 def same_value(a: Value, b: Value) -> bool:

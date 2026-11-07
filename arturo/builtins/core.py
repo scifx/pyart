@@ -1289,10 +1289,24 @@ def _switch(ev, args):
     return branch
 
 
+def _loop_plan(ev, cond, body, until: bool):
+    """Compiled ``while``/``until`` plan, or ``None`` when not applicable."""
+    if not isinstance(cond, V.Block) or not isinstance(body, V.Block):
+        return None
+    if ev.ctx.collectors:
+        return None
+    return ev.ast_module.while_plan(ev._tree_for(cond), ev._tree_for(body), until,
+                                    ev._tree_for)
+
+
 @impl("while")
 def _while(ev, args):
     cond, body = args[0], args[1]
     from ..evaluator import BreakSignal, ContinueSignal
+
+    plan = _loop_plan(ev, cond, body, False)
+    if plan is not None:
+        return plan(ev)
 
     result: V.Value = V.NULL
     count = 0
@@ -1319,6 +1333,10 @@ def _until(ev, args):
     # Arturo's ``until`` takes the *action* first, then the condition
     body, cond = args[0], args[1]
     from ..evaluator import BreakSignal, ContinueSignal
+
+    plan = _loop_plan(ev, cond, body, True)
+    if plan is not None:
+        return plan(ev)
 
     result: V.Value = V.NULL
     while True:

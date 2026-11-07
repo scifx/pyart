@@ -21,17 +21,18 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from . import values as V
+from .library import VersionedDict
 from .parser import INFIX_ALIASES, PREFIX_ALIASES, STRUCTURAL
 
 # infix aliases registered at runtime via ``alias.infix``
-DYNAMIC_INFIX: dict = {}
+DYNAMIC_INFIX: dict = VersionedDict()
 
 
 class Node:
     """A node of the generated tree."""
 
     __slots__ = ("kind", "children", "parent", "params", "arity", "value", "name",
-                 "cache", "fast")
+                 "cache", "fast", "meta")
 
     def __init__(self, kind: str, arity: int = -1, value=None, name: str = ""):
         self.kind = kind
@@ -40,6 +41,7 @@ class Node:
         self.params = 0
         self.cache = None
         self.fast = None
+        self.meta = None
         self.arity = arity
         self.value = value
         self.name = name
@@ -483,6 +485,8 @@ _SLOW_CALLS = {"else", "case", "when?", "do", "loop", "map", "select", "filter",
 
 
 def _int_div(x, y):
+    if y > 0 and x >= 0:
+        return x // y
     if y == 0:
         return None
     q = abs(x) // abs(y)
@@ -490,6 +494,8 @@ def _int_div(x, y):
 
 
 def _int_mod(x, y):
+    if y > 0 and x >= 0:
+        return x % y
     if y == 0:
         return None
     r = abs(x) % abs(y)
@@ -524,7 +530,13 @@ _INT_SPEC = {
 
 
 def _dispatch(ev, node, name, args):
-    """Resolve ``name`` and run it with already-evaluated ``args``."""
+    """Resolve ``name`` and run it with already-evaluated ``args``.
+
+    Like the generic call path, a call is a fresh (scoped) evaluation context:
+    an enclosing ``execUnscoped`` block must not leak its value collection into
+    the blocks this call runs.  Restoring the flag here is what lets the
+    compiled fast paths stay enabled inside unscoped blocks.
+    """
     ctx = ev.ctx
     fn = ctx.syms.get(name)
     if fn is None or not isinstance(fn, V.Function):
@@ -533,17 +545,932 @@ def _dispatch(ev, node, name, args):
             fn = ev._resolve_callable(name)
             node.cache = fn
     impl = fn.impl
-    if impl is not None:
-        result = impl(ev, args)
-    else:
-        result = ev._call_user(fn, args, name)
+    unscoped = ctx.unscoped
+    if unscoped:
+        ctx.unscoped = False
+    try:
+        if impl is not None:
+            result = impl(ev, args)
+        else:
+            result = ev._call_user(fn, args, name)
+    finally:
+        if unscoped:
+            ctx.unscoped = unscoped
     if result is not V.VOID:
         ctx.last_pushed = result
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# Fast paths, level 2: expression subtrees compiled into real Python source
+# ---------------------------------------------------------------------------
+# The closures below are a hand-rolled compiler: every node becomes a Python
+# function call.  For numeric code that is dominated by call overhead, so hot
+# expression trees are translated into a single generated Python function
+# instead - one function entry per statement, with integer arithmetic inlined
+# and no intermediate boxing.
+class _Uncompilable(Exception):
+    pass
+
+
+_INT_OPS = {"add": "+", "sub": "-", "mul": "*"}
+_CMP_OPS = {"equal?": "==", "notEqual?": "!=", "less?": "<", "greater?": ">",
+            "lessOrEqual?": "<=", "greaterOrEqual?": ">="}
+_HELPER_OPS = {"div": "_int_div", "mod": "_int_mod", "pow": "_int_pow"}
+_UNARY_OPS = {"inc": 1, "dec": -1}
+_FUSABLE = set(_INT_OPS) | set(_CMP_OPS) | set(_HELPER_OPS)
+# control flow that only needs its arguments passed through unchanged
+_COMPILABLE_SLOW = {"if", "unless", "switch", "switch?"}
+_CONST_FROZEN = ("string", "block", "inline", "dictionary", "object")
+
+
+def _is_leaf(node) -> bool:
+    return node.kind == "constant" or node.kind == "variable"
+
+
+def _can_fuse(node) -> bool:
+    """Can ``node`` be evaluated as a single unboxed Python integer?
+
+    Comparisons are *not* fusable: their result is a Logical, so using them
+    inside an arithmetic expression would silently turn Arturo's
+    type-ordered comparison into a Python bool.
+    """
+    kind = node.kind
+    if kind == "constant":
+        return type(node.value) is V.Integer
+    if kind == "variable":
+        return True
+    if kind != "call":
+        return False
+    children = node.children
+    if node.name == "size":
+        return len(children) == 1 and children[0].kind == "variable"
+    if node.name == "get":
+        return (len(children) == 2 and children[0].kind == "variable"
+                and _is_leaf(children[1]) and _can_fuse(children[1]))
+    if node.name in _UNARY_OPS:
+        return len(children) == 1 and _can_fuse(children[0])
+    if node.name not in _INT_OPS and node.name not in _HELPER_OPS:
+        return False
+    if len(children) != 2:
+        return False
+    if children[0].kind == "attribute" or children[1].kind == "attribute":
+        return False
+    if node.name in _HELPER_OPS and not _is_leaf(children[1]):
+        # the guard (``y != 0``) has to be cheap enough to duplicate
+        return False
+    return _can_fuse(children[0]) and _can_fuse(children[1])
+
+
+def _call_count(node, limit=2) -> int:
+    """Number of call nodes in the subtree, saturating at ``limit``."""
+    total = 1 if node.kind == "call" else 0
+    for child in node.children:
+        if total >= limit:
+            return total
+        total += _call_count(child, limit)
+    return total
+
+
+class _Compiler:
+    """Generates the body of a Python function evaluating one AST subtree."""
+
+    def __init__(self, prebound=None, trees=None):
+        self.prebound = prebound or {}
+        self.trees = trees
+        self.hoist = False
+        self.hoisted: List[tuple] = []
+        self.lines: List[str] = []
+        self.counter = 0
+        self.leaf_counter = 0
+        self.leaf_order: List[tuple] = []
+        self.leaf_locals: dict = {}
+        self.consts: List[V.Value] = []
+        self.nodes: List[Node] = []
+        self.depth = 1
+
+    # -- emission helpers -------------------------------------------------
+    def emit(self, text: str) -> None:
+        self.lines.append("    " * self.depth + text)
+
+    def open(self, text: str) -> None:
+        self.emit(text)
+        self.depth += 1
+
+    def close(self) -> None:
+        self.depth -= 1
+
+    def tmp(self) -> str:
+        self.counter += 1
+        return "t%d" % self.counter
+
+    def const(self, value) -> str:
+        self.consts.append(value)
+        return "_c[%d]" % (len(self.consts) - 1)
+
+    def node_ref(self, node) -> str:
+        self.nodes.append(node)
+        return "_n[%d]" % (len(self.nodes) - 1)
+
+    # -- fused integer expressions ---------------------------------------
+    def fused(self, node, guards) -> str:
+        kind = node.kind
+        if kind == "constant":
+            return repr(node.value.data)
+        if kind == "variable":
+            symbol = node.value.data
+            pre = self.prebound.get(symbol)
+            if pre is not None and pre[1] == "int":
+                return pre[0]           # already an unboxed Python int
+            local = self.leaf(symbol, "Int")
+            return local + ".data"
+        name = node.name
+        if name == "size" and len(node.children) == 1 \
+                and node.children[0].kind == "variable":
+            local = self.leaf(node.children[0].value.data, "Seq")
+            return "len(%s.data)" % local
+        if name == "get":
+            container = self.leaf(node.children[0].value.data, "Block")
+            index = self.fused(node.children[1], guards)
+            guards.append("0 <= %s < len(%s.data)" % (index, container))
+            guards.append("type(%s.data[%s]) is Int" % (container, index))
+            return "%s.data[%s].data" % (container, index)
+        if name in _UNARY_OPS:
+            operand = self.fused(node.children[0], guards)
+            return "(%s %s 1)" % (operand, "+" if _UNARY_OPS[name] > 0 else "-")
+        left = self.fused(node.children[0], guards)
+        right = self.fused(node.children[1], guards)
+        if name in _INT_OPS:
+            return "(%s %s %s)" % (left, _INT_OPS[name], right)
+        if name in _HELPER_OPS:
+            helper = _HELPER_OPS[name]
+            if name == "pow":
+                guards.append("%s >= 0" % right)
+            else:
+                guards.append("%s != 0" % right)
+            return "%s(%s, %s)" % (helper, left, right)
+        return "(%s %s %s)" % (left, _CMP_OPS[name], right)
+
+    def emit_leaf_decls(self) -> None:
+        if self.hoist:
+            self.hoisted.extend(self.leaf_order)
+            return
+        for local, symbol, _expected in self.leaf_order:
+            if symbol is None:  # pre-bound local
+                continue
+            self.emit("%s = syms.get(%r)" % (local, symbol))
+            self.open("if %s is None:" % local)
+            self.emit("%s = ctx.get(%r)" % (local, symbol))
+            self.close()
+
+    def leaf(self, symbol: str, expected: str) -> str:
+        """Local holding ``symbol``, checked to be of type ``expected``."""
+        pre = self.prebound.get(symbol)
+        if pre is not None:
+            local, known = pre
+            if known is expected:
+                return local
+            if local not in self.leaf_locals:
+                self.leaf_locals[local] = local
+                self.leaf_order.append((local, None, expected))
+            return local
+        local = self.leaf_locals.get(symbol)
+        if local is None:
+            local = "s%d" % self.leaf_counter
+            self.leaf_counter += 1
+            self.leaf_locals[symbol] = local
+            self.leaf_order.append((local, symbol, expected))
+        return local
+
+    def guard(self, guards) -> str:
+        hoisted = {local for local, symbol, _ in self.hoisted
+                   if symbol is not None} if self.hoist else ()
+        parts = []
+        for local, _symbol, expected in self.leaf_order:
+            if local in hoisted:
+                parts.append("ok_%s" % local)
+            else:
+                test = _TYPE_TEST.get(expected)
+                parts.append(test.format(local) if test
+                             else "type(%s) is %s" % (local, expected))
+        parts.extend(guards)
+        return " and ".join(parts) if parts else "True"
+
+    # -- values -----------------------------------------------------------
+    def value(self, node) -> str:
+        kind = node.kind
+        if kind == "constant":
+            return self.const(node.value)
+        if kind == "variable":
+            symbol = node.value.data
+            pre = self.prebound.get(symbol)
+            if pre is not None:
+                if pre[1] == "int":
+                    return "Int(%s)" % pre[0]      # box the unboxed index
+                return pre[0]
+            target = self.tmp()
+            self.emit("%s = syms.get(%r)" % (target, symbol))
+            self.open("if %s is None:" % target)
+            self.emit("%s = ctx.get(%r)" % (target, symbol))
+            self.close()
+            return target
+        if kind == "store":
+            return self.store(node)
+        if kind == "call":
+            return self.call(node)
+        raise _Uncompilable(kind)
+
+    def store(self, node) -> str:
+        if len(node.children) != 1 or node.children[0].kind == "attribute":
+            raise _Uncompilable("store")
+        value = self.value(node.children[0])
+        target = self.tmp()
+        self.emit("%s = %s" % (target, value))
+        self.open("if %s is not VOID:" % target)
+        self.open("if getattr(%s, 'frozen', False) and %s.kind in _CONST_FROZEN:"
+                  % (target, target))
+        self.emit("%s = _copy_value(%s)" % (target, target))
+        self.close()
+        self.emit("ctx.set(%r, %s)" % (node.value.data, target))
+        self.close()
+        return target
+
+    def _modpow(self, node, guards):
+        """Rewrite ``mod(pow(b, n), m)`` (also ``inc``/``add`` of a power).
+
+        ``(k + b ** n) % m`` only needs ``b ** n % m``: modular reduction is a
+        ring homomorphism, so raising to a power *with* the modulus computes
+        the same residue while keeping the intermediate numbers small.  The
+        rewrite is guarded on non-negative integers, so it can never change a
+        result - it just avoids building gigantic intermediates.
+        """
+        left = node.children[0]
+        addend = 0
+        power = left
+        if left.kind == "call":
+            if left.name == "inc" and len(left.children) == 1:
+                addend, power = 1, left.children[0]
+            elif left.name == "add" and len(left.children) == 2:
+                first, second = left.children
+                if first.kind == "constant" and type(first.value) is V.Integer:
+                    addend, power = first.value.data, second
+                elif second.kind == "constant" and type(second.value) is V.Integer:
+                    addend, power = second.value.data, first
+        if power.kind != "call" or power.name != "pow" or len(power.children) != 2:
+            return None
+        if addend < 0:
+            return None
+        base, exponent = power.children
+        if not (_can_fuse(base) and _can_fuse(exponent)):
+            return None
+        return base, exponent, addend
+
+    def try_modpow(self, node, target) -> bool:
+        parts = self._modpow(node, None)
+        if parts is None:
+            return False
+        base, exponent, addend = parts
+        modulus = node.children[1]
+        if not _can_fuse(modulus):
+            return False
+        self.leaf_order = []
+        self.leaf_locals = {}
+        guards: List[str] = []
+        # right-to-left evaluation order, like every other argument
+        mod_expr = self.fused(modulus, guards)
+        base_expr = self.fused(base, guards)
+        exp_expr = self.fused(exponent, guards)
+        self.emit_leaf_decls()
+        reduced = "pow(%s, %s, %s)" % (base_expr, exp_expr, mod_expr)
+        if addend:
+            reduced = "((%d + %s) %% %s)" % (addend, reduced, mod_expr)
+        guards.extend(["%s >= 0" % base_expr, "%s >= 0" % exp_expr,
+                       "%s > 0" % mod_expr])
+        self.open("if %s:" % self.guard(guards))
+        self.emit("%s = Int(%s)" % (target, reduced))
+        self.close()
+        self.open("else:")
+        self.generic_call(node, target)
+        self.close()
+        return True
+
+    def condition(self, node) -> str:
+        """Emit ``node`` so that its truth value is a plain Python bool."""
+        if (node.kind == "constant" and type(node.value) is V.Block
+                and self.trees is not None):
+            # a block condition is *evaluated*, not tested as a value
+            inner = self.trees(node.value)
+            if len(inner.children) == 1:
+                return self.condition(inner.children[0])
+            raise _Uncompilable("block condition")
+        if (node.kind == "call" and node.name in _CMP_OPS and len(node.children) == 2
+                and _can_fuse(node.children[0]) and _can_fuse(node.children[1])):
+            self.leaf_order = []
+            self.leaf_locals = {}
+            guards: List[str] = []
+            right = self.fused(node.children[1], guards)
+            left = self.fused(node.children[0], guards)
+            self.emit_leaf_decls()
+            result = self.tmp()
+            self.open("if %s:" % self.guard(guards))
+            self.emit("%s = %s %s %s" % (result, left, _CMP_OPS[node.name], right))
+            self.close()
+            self.open("else:")
+            value = self.value(node)
+            self.emit("%s = _is_true(%s)" % (result, value))
+            self.close()
+            return result
+        value = self.value(node)
+        result = self.tmp()
+        self.emit("%s = _is_true(%s)" % (result, value))
+        return result
+
+    def statement(self, node) -> str:
+        """Compile one statement of an inlined block; returns its value."""
+        if node.kind == "call":
+            name = node.name
+            if name in _SLOW_CALLS and name not in _COMPILABLE_SLOW:
+                self.control(name, node)
+                return ""
+            if name == "if":
+                target = self.try_inline_if(node)
+                if target is not None:
+                    return target
+        return self.value(node)
+
+    def control(self, name: str, node) -> None:
+        """Compile ``return``/``break``/``continue`` into the matching signal."""
+        if name == "return":
+            if node.children:
+                self.emit("raise _ReturnSignal(%s)" % self.value(node.children[0]))
+            else:
+                self.emit("raise _ReturnSignal(NULL)")
+        elif name == "break":
+            self.emit("raise _BreakSignal()")
+        elif name == "continue":
+            self.emit("raise _ContinueSignal()")
+        else:
+            raise _Uncompilable(name)
+
+    def try_inline_if(self, node):
+        """Inline ``if condition -> body`` (a straight jump, no dispatch)."""
+        children = node.children
+        if len(children) != 2 or self.trees is None:
+            return None
+        body = children[1]
+        if body.kind != "constant" or type(body.value) is not V.Block:
+            return None
+        try:
+            tree = self.trees(body.value)
+            save_lines, save_depth = self.lines, self.depth
+            self.lines = []
+            self.depth = 0
+            try:
+                values = [self.statement(stmt) for stmt in tree.children]
+            except _Uncompilable:
+                self.lines = save_lines
+                self.depth = save_depth
+                return None
+            inner, self.lines = self.lines, save_lines
+            self.depth = save_depth
+        except _Uncompilable:
+            return None
+        try:
+            test = self.condition(children[0])
+        except _Uncompilable:
+            return None
+        target = self.tmp()
+        self.emit("%s = VOID" % target)
+        self.open("if %s:" % test)
+        pad = "    " * self.depth
+        self.lines.extend(pad + line for line in inner)
+        if values and values[-1]:
+            self.emit("%s = %s" % (target, values[-1]))
+        self.close()
+        return target
+
+    def try_convert(self, node, target) -> bool:
+        """``to :integer`` / ``to :string`` without a builtin lookup."""
+        children = node.children
+        if len(children) != 2 or children[0].kind != "constant":
+            return False
+        kind = children[0].value
+        if type(kind) is not V.Type:
+            return False
+        helper = _CONVERT_FAST.get(kind.data)
+        if helper is None:
+            return False
+        for child in children:
+            if child.kind == "attribute":
+                return False
+        value = self.value(children[1])
+        raw = self.tmp()
+        self.emit("%s = %s(ev, %s)" % (raw, helper[0], value))
+        self.open("if %s is None:" % raw)
+        self.generic_call(node, target)
+        self.close()
+        self.open("else:")
+        self.emit("%s = %s(%s)" % (target, helper[1], raw))
+        self.close()
+        return True
+
+    def call(self, node) -> str:
+        children = node.children
+        name = node.name
+        if name == "if":
+            target = self.try_inline_if(node)
+            if target is not None:
+                return target
+        if name in _SLOW_CALLS and name not in _COMPILABLE_SLOW:
+            raise _Uncompilable(name)
+        target = self.tmp()
+        for child in children:
+            if child.kind == "attribute":
+                # attributes reach the builtin through the attribute stack, so
+                # a call that has any is never fused - only dispatched
+                self.generic_call(node, target)
+                return target
+        if name == "to" and self.try_convert(node, target):
+            return target
+        if name == "mod" and len(children) == 2:
+            if self.try_modpow(node, target):
+                return target
+        if name in _CMP_OPS and len(children) == 2 and \
+                _can_fuse(children[0]) and _can_fuse(children[1]):
+            self.leaf_order = []
+            self.leaf_locals = {}
+            guards: List[str] = []
+            # arguments are evaluated right-to-left, so are the leaves
+            right = self.fused(children[1], guards)
+            left = self.fused(children[0], guards)
+            expr = "(%s %s %s)" % (left, _CMP_OPS[name], right)
+            self.emit_leaf_decls()
+            self.open("if %s:" % self.guard(guards))
+            self.emit("%s = TRUE if %s else FALSE" % (target, expr))
+            self.close()
+            self.open("else:")
+            self.generic_call(node, target)
+            self.close()
+            return target
+        if name in _INT_OPS and len(children) == 2 and _can_fuse(node):
+            self.leaf_order = []
+            self.leaf_locals = {}
+            guards = []
+            expr = self.fused(node, guards)
+            self.emit_leaf_decls()
+            self.open("if %s:" % self.guard(guards))
+            self.emit("%s = Int(%s)" % (target, expr))
+            self.close()
+            self.open("else:")
+            self.generic_call(node, target)
+            self.close()
+            return target
+        self.generic_call(node, target)
+        return target
+
+    def attribute(self, node) -> None:
+        """Push ``.attr:value`` onto the attribute stack."""
+        self.emit("ctx.push_attr(%r, %s)"
+                  % (node.value.data, self.value(node.children[0])))
+
+    def generic_call(self, node, target) -> None:
+        name = node.name
+        ref = "%s, %r" % (self.node_ref(node), name)
+        args = []
+        has_attr = False
+        for child in reversed(node.children):
+            if child.kind == "attribute":
+                has_attr = True
+                self.attribute(child)
+                continue
+            args.append(self.value(child))
+        if not args:
+            self.emit("%s = _dispatch(ev, %s, [])" % (target, ref))
+            return
+        if len(args) == 1:
+            self.emit("%s = _dispatch(ev, %s, [] if %s is VOID else [%s])"
+                      % (target, ref, args[0], args[0]))
+            return
+        # ``args`` is in evaluation (right-to-left) order; ``ordered`` is in
+        # declaration order, which is what every call ultimately receives.
+        first, second = args[0], args[1]
+        ordered = args[::-1]
+        self.open("if %s is VOID or %s is VOID:" % (first, second))
+        self.emit("%s = _dispatch(ev, %s, _order_args(%s))"
+                  % (target, ref, ", ".join(args)))
+        self.close()
+        if len(args) == 2 and name in _INT_SPEC and not has_attr:
+            left, right = ordered[0], ordered[1]
+            self.open("elif type(%s) is Int and type(%s) is Int:" % (left, right))
+            lhs = "%s.data" % left
+            rhs = "%s.data" % right
+            if name in _INT_OPS:
+                self.emit("%s = Int(%s %s %s)" % (target, lhs, _INT_OPS[name], rhs))
+            elif name in _CMP_OPS:
+                self.emit("%s = TRUE if %s %s %s else FALSE"
+                          % (target, lhs, _CMP_OPS[name], rhs))
+            else:
+                # the helper signals "not applicable" by returning None, so
+                # keep its result instead of calling it twice (that doubles
+                # the cost of e.g. big-integer exponentiation)
+                helper = _HELPER_OPS[name]
+                raw = self.tmp()
+                self.emit("%s = %s(%s, %s)" % (raw, helper, lhs, rhs))
+                self.open("if %s is None:" % raw)
+                self.emit("%s = _dispatch(ev, %s, [%s, %s])"
+                          % (target, ref, left, right))
+                self.close()
+                self.open("else:")
+                self.emit("%s = Int(%s)" % (target, raw))
+                self.close()
+            self.close()
+        self.open("else:")
+        self.emit("%s = _dispatch(ev, %s, [%s])"
+                  % (target, ref, ", ".join(ordered)))
+        self.close()
+
+
+def _to_int_fast(ev, value):
+    """``to :integer`` for the common cases (``None`` => use the builtin)."""
+    if ev.ctx.attrs:
+        return None
+    kind = value.kind
+    if kind == "integer":
+        return value.data
+    if kind == "string":
+        text = value.data
+        if text.isdigit():
+            return int(text) if len(text) < 19 else None
+        text = text.strip()
+        if len(text) > 15:
+            return None
+        try:
+            if text[:2].lower() == "0x":
+                return int(text, 16)
+            if "." in text or "e" in text.lower():
+                return int(float(text))
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_str_fast(ev, value):
+    """``to :string`` for the common cases (``None`` => use the builtin)."""
+    if ev.ctx.attrs:
+        return None
+    kind = value.kind
+    if kind == "string":
+        return value.data
+    if kind == "integer":
+        return str(value.data)
+    if kind == "char":
+        return value.data
+    return None
+
+
+_CONVERT_FAST = {"integer": ("_to_int_fast", "Int"),
+                 "string": ("_to_str_fast", "String")}
+
+
+def _break_signal():
+    from .evaluator import BreakSignal
+    return BreakSignal
+
+
+def _continue_signal():
+    from .evaluator import ContinueSignal
+    return ContinueSignal
+
+
+def _return_signal():
+    from .evaluator import ReturnSignal
+    return ReturnSignal
+
+
+_BreakSignal = _break_signal()
+_ContinueSignal = _continue_signal()
+_ReturnSignal = _return_signal()
+
+_UNCACHED = object()
+
+
+def _fully_fused(node) -> bool:
+    if node.kind == "call" and node.name in _CMP_OPS and len(node.children) == 2:
+        return _can_fuse(node.children[0]) and _can_fuse(node.children[1])
+    return _can_fuse(node)
+
+
+# guard snippets for leaves whose type is a union
+_TYPE_TEST = {
+    "Seq": "(type({0}) is Block or type({0}) is String or type({0}) is Inline)",
+}
+
+_PURE_CALLS = frozenset(_INT_OPS) | frozenset(_CMP_OPS) | frozenset(_UNARY_OPS) \
+    | frozenset(_HELPER_OPS)
+
+
+def _pure(node, trees=None) -> bool:
+    """Can this statement run without observing or mutating the symbol table?
+
+    Such statements only combine values that are read once, so their free
+    variables may be hoisted out of the loop.  Blocks, stores and any other
+    call (a user function could touch globals, or evaluate a closure that
+    rebinds the loop parameter) disqualify a statement.
+    """
+    kind = node.kind
+    if kind == "constant":
+        return type(node.value) is not V.Block and type(node.value) is not V.Inline
+    if kind == "variable":
+        return True
+    if kind != "call":
+        return False
+    name = node.name
+    children = node.children
+    if name == "if":
+        if not children or not _pure(children[0], trees):
+            return False
+        body = children[1] if len(children) > 1 else None
+        if body is None:
+            return True
+        if body.kind == "constant" and type(body.value) is V.Block:
+            if trees is None:
+                return False
+            try:
+                inner = trees(body.value)
+            except Exception:  # pragma: no cover - defensive
+                return False
+            return all(_pure(stmt, trees) for stmt in inner.children)
+        return False
+    if name in ("return", "break", "continue"):
+        return all(_pure(child, trees) for child in children)
+    if name not in _PURE_CALLS and name != "get":
+        return False
+    return all(_pure(child, trees) for child in children)
+
+
+def _has_control_flow(node) -> bool:
+    """Does the subtree contain ``break``/``continue``/``return``?"""
+    if node.kind == "call" and node.name in _SLOW_CALLS \
+            and node.name not in _COMPILABLE_SLOW:
+        return True
+    for child in node.children:
+        if _has_control_flow(child):
+            return True
+    return False
+
+
+def _loop_limit() -> None:
+    from .evaluator import ArturoError
+
+    raise ArturoError("Value Error", "loop limit exceeded")
+
+
+def _codegen_while(cond_nodes, body_nodes, until: bool, trees=None):
+    """Compile a whole ``while``/``until`` statement into one function."""
+    if not cond_nodes or not body_nodes:
+        return None
+    compiler = _Compiler(trees=trees)
+    try:
+        compiler.depth = 2
+        if len(cond_nodes) == 1:
+            test = compiler.condition(cond_nodes[0])
+        else:
+            for node in cond_nodes[:-1]:
+                compiler.statement(node)
+            test = compiler.condition(cond_nodes[-1])
+        cond_lines = compiler.lines
+
+        compiler.lines = []
+        compiler.depth = 3
+        values = [compiler.statement(node) for node in body_nodes]
+        body_lines = compiler.lines
+    except _Uncompilable:
+        return None
+    tail = []
+    if values and values[-1]:
+        tail.append("            last = %s" % values[-1])
+    guard = ("        if %s: break" if until else "        if not %s: break") % test
+    body_run = (
+        "        n += 1\n"
+        "        if n > 5000000:\n"
+        "            _loop_limit()\n"
+        "        try:\n"
+        + "\n".join(body_lines) + "\n"
+        + ("\n".join(tail) + "\n" if tail else "")
+        + "        except _BreakSignal:\n"
+        "            break\n"
+        "        except _ContinueSignal:\n"
+        + ("            pass\n" if until else "            continue\n")
+    )
+    head = (
+        "def _loop(ev, _c=_c, _n=_n):\n"
+        "    ctx = ev.ctx\n"
+        "    syms = ctx.syms\n"
+        "    last = NULL\n"
+        "    n = 0\n"
+        "    while True:\n"
+    )
+    if until:
+        source = head + body_run + "\n".join(cond_lines) + "\n" + guard + "\n    return last\n"
+    else:
+        source = head + "\n".join(cond_lines) + "\n" + guard + "\n" + body_run \
+            + "    return last\n"
+    namespace = _namespace(compiler)
+    try:
+        exec(compile(source, "<arturo-fastloop>", "exec"), namespace)
+    except SyntaxError:  # pragma: no cover - defensive
+        return None
+    return namespace["_loop"]
+
+
+def while_plan(cond_tree, body_tree, until: bool, trees=None):
+    """Cached compiled ``while``/``until`` for these two block trees."""
+    if cond_tree is None or body_tree is None:
+        return None
+    meta = cond_tree.meta
+    if meta is None:
+        meta = cond_tree.meta = {}
+    key = ("while", id(body_tree), until)
+    plan = meta.get(key, _UNCACHED)
+    if plan is _UNCACHED:
+        plan = _codegen_while(cond_tree.children, body_tree.children, until, trees)
+        meta[key] = plan
+    return plan
+
+
+def _namespace(compiler) -> dict:
+    """Globals shared by every generated function."""
+    return {
+        "Int": V.Integer, "String": V.String, "Block": V.Block,
+        "Inline": V.Inline,
+        "TRUE": V.TRUE, "FALSE": V.FALSE, "VOID": V.VOID, "NULL": V.NULL,
+        "_dispatch": _dispatch, "_order_args": _order_args,
+        "_int_div": _int_div, "_int_mod": _int_mod, "_int_pow": _int_pow,
+        "_copy_value": V.copy_value, "_CONST_FROZEN": _CONST_FROZEN,
+        "_is_true": V.is_true, "_BreakSignal": _BreakSignal,
+        "_ContinueSignal": _ContinueSignal, "_ReturnSignal": _ReturnSignal,
+        "_to_int_fast": _to_int_fast, "_to_str_fast": _to_str_fast,
+        "_loop_limit": _loop_limit,
+        "_c": tuple(compiler.consts), "_n": compiler.nodes,
+    }
+
+
+def _codegen_iterator(nodes, mode: str, param: str, wrap_int: bool,
+                      index_name: str = None, trees=None):
+    """Compile a whole ``select``/``map``/``filter``/``loop`` into one function.
+
+    The generic loop pays a Python call, a boxing operation and a truth test
+    per item.  This emits the loop, the parameter binding and the statements as
+    one straight-line function, so numeric predicates never build an
+    intermediate value at all.
+    """
+    if not nodes:
+        return None
+    for node in nodes:
+        if node.kind == "call" and node.name in _SLOW_CALLS \
+                and node.name not in _COMPILABLE_SLOW:
+            return None
+    prebound = {param: ("it", "int" if wrap_int else None)}
+    if index_name is not None:
+        prebound[index_name] = ("ipos", "int")
+    compiler = _Compiler(prebound=prebound, trees=trees)
+    compiler.depth = 3
+    # hoisting reads the free variables *before* the loop, which is only safe
+    # while nothing in the body can write to them
+    compiler.hoist = all(_pure(node, trees) for node in nodes)
+    try:
+        if mode in ("loop", "map"):
+            value = ""
+            for node in nodes:
+                result = compiler.statement(node)
+                if result:
+                    value = result
+            if not value:
+                value = "VOID"
+            compiler.emit(("last = %s" if mode == "loop" else "append(%s)") % value)
+        elif mode in ("every", "some"):
+            for node in nodes[:-1]:
+                compiler.statement(node)
+            test = compiler.condition(nodes[-1])
+            compiler.emit(("if %s:" if mode == "some" else "if not %s:") % test)
+            compiler.depth += 1
+            # plain Python bools: the caller wraps them in a Logical value
+            compiler.emit("return %s" % ("True" if mode == "some" else "False"))
+            compiler.depth -= 1
+        else:
+            for node in nodes[:-1]:
+                compiler.statement(node)
+            test = compiler.condition(nodes[-1])
+            compiler.emit(("if %s:" if mode == "select" else "if not %s:") % test)
+            compiler.depth += 1
+            compiler.emit("append(it)")
+            compiler.depth -= 1
+    except _Uncompilable:
+        return None
+
+    prelude = []
+    for local, symbol, expected in compiler.hoisted:
+        if symbol is None:
+            continue
+        prelude.append("    %s = syms.get(%r)" % (local, symbol))
+        prelude.append("    if %s is None:" % local)
+        prelude.append("        %s = ctx.get(%r)" % (local, symbol))
+        prelude.append("    ok_%s = type(%s) is %s" % (local, local, expected))
+    bind = ["        it = raw"]
+    if index_name is not None:
+        bind.append("        ipos = pos")
+        bind.append("        pos += 1")
+        if not compiler.hoist:
+            bind.append("        syms[%r] = Int(ipos)" % index_name)
+    if not compiler.hoist:
+        bind.append("        syms[%r] = %s" % (param, "Int(it)" if wrap_int else "it"))
+    body = "\n".join(compiler.lines)
+    source = (
+        "def _iter(ev, seq, _c=_c, _n=_n):\n"
+        "    ctx = ev.ctx\n"
+        "    syms = ctx.syms\n"
+        + ("    last = NULL\n" if mode == "loop" else
+           "" if mode in ("every", "some") else
+           "    out = []\n    append = out.append\n")
+        + ("    pos = 0\n" if index_name is not None else "")
+        + "\n".join(prelude) + ("\n" if prelude else "")
+        + "    for raw in seq:\n"
+        + "\n".join(bind) + "\n"
+        "        try:\n"
+        + body + "\n"
+        "        except _BreakSignal:\n"
+        "            break\n"
+        "        except _ContinueSignal:\n"
+        "            continue\n"
+        + ("    return last\n" if mode == "loop" else
+           "    return %s\n" % ("True" if mode == "every" else "False")
+           if mode in ("every", "some") else
+           ("    return [Int(v) for v in out]\n"
+            if wrap_int and mode in ("select", "filter") else "    return out\n"))
+    )
+    namespace = _namespace(compiler)
+    try:
+        exec(compile(source, "<arturo-fastloop>", "exec"), namespace)
+    except SyntaxError:  # pragma: no cover - defensive
+        return None
+    return namespace["_iter"]
+
+
+def iterator_plan(tree: Node, mode: str, param: str, wrap_int: bool,
+                  index_name: str = None, trees=None):
+    """Cached compiled loop for ``tree``, or ``None`` when unavailable."""
+    meta = tree.meta
+    if meta is None:
+        meta = tree.meta = {}
+    key = (mode, param, wrap_int, index_name)
+    plan = meta.get(key, _UNCACHED)
+    if plan is _UNCACHED:
+        plan = _codegen_iterator(tree.children, mode, param, wrap_int,
+                                 index_name, trees) if tree.children else None
+        meta[key] = plan
+    return plan
+
+
+def _codegen(node):
+    """Compile ``node`` into a Python function, or return ``None``."""
+    if node.kind not in ("call", "store", "variable"):
+        return None
+    if _call_count(node) < 2:
+        return None
+    compiler = _Compiler()
+    try:
+        result = compiler.value(node)
+    except _Uncompilable:
+        return None
+    except (AttributeError, IndexError):  # pragma: no cover - defensive
+        return None
+    compiler.emit("return %s" % result)
+    source = "def _fast(ev, _c=_c, _n=_n):\n    ctx = ev.ctx\n    syms = ctx.syms\n" \
+             + "\n".join(compiler.lines) + "\n"
+    namespace = _namespace(compiler)
+    try:
+        exec(compile(source, "<arturo-fastpath>", "exec"), namespace)
+    except SyntaxError:  # pragma: no cover - defensive
+        return None
+    return namespace["_fast"]
+
+
+def _order_args(*args):
+    """Reproduce the evaluator's argument order for VOID-filtered calls."""
+    args = [a for a in args if a is not V.VOID]
+    if len(args) > 1:
+        args = args[::-1]
+    return list(args)
+
+
 def _compile_node(node) -> None:
     """Attach a compiled closure to simple nodes (no attributes/pipes)."""
+    fast = _codegen(node)
+    if fast is not None:
+        node.fast = fast
+        return
     for child in node.children:
         _compile_node(child)
     kind = node.kind

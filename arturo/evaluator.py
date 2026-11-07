@@ -198,7 +198,7 @@ class Evaluator:
             return self.ctx.get(name)
         if kind == "store":
             fast = node.fast
-            if fast is not None and not self.ctx.unscoped:
+            if fast is not None:
                 return fast(self)
             value = self._eval_children_first(node)
             if value is V.VOID:
@@ -217,7 +217,7 @@ class Evaluator:
             return V.NULL
         if kind == "call":
             fast = node.fast
-            if fast is not None and not self.ctx.unscoped:
+            if fast is not None:
                 result = fast(self)
                 if result is not None:
                     return result
@@ -228,7 +228,7 @@ class Evaluator:
                 collector = self.ctx.collectors[-1] if self.ctx.collectors else None
                 before = len(collector) if collector is not None else 0
                 fast = child.fast
-                value = fast(self) if (fast is not None and not self.ctx.unscoped) else self.eval_node(child)
+                value = fast(self) if fast is not None else self.eval_node(child)
                 if value is None:
                     value = self.eval_node(child)
                 if value is not V.VOID:
@@ -338,6 +338,12 @@ class Evaluator:
             self.ctx.depth -= 1
 
     def _call_user(self, fn: V.Function, args: List[V.Value], name: str) -> V.Value:
+        plan = fn._fast_plan
+        if plan is None and not fn._fast_plan_done:
+            plan = fn._fast_plan = _fast_call_plan(fn)
+            fn._fast_plan_done = True
+        if plan is not None and len(args) == fn.arity:
+            return self._call_user_fast(fn, args, plan)
         if len(args) != fn.arity:
             raise ArturoError(
                 "Value Error",
@@ -407,6 +413,45 @@ class Evaluator:
             fn._memo[key] = result
         return result
 
+    def _call_user_fast(self, fn: V.Function, args: List[V.Value],
+                        names: List[str]) -> V.Value:
+        """Ordinary user function: bind parameters into a compact frame.
+
+        The generic path re-derives the parameter names, filters type
+        constraints, walks imports/exports and updates the symbol table one
+        parameter at a time.  For a plain function none of that can apply, so
+        the frame can be built directly.
+        """
+        ctx = self.ctx
+        depth = ctx.depth + 1
+        if depth > 12000:
+            raise ArturoError("Stack Error", "Stack limit exceeded")
+        ctx.depth = depth
+        syms = ctx.syms
+        frame = {}
+        get = syms.get
+        for index, param in enumerate(names):
+            previous = get(param, MISSING)
+            if previous is not MISSING and param not in frame:
+                frame[param] = previous
+            syms[param] = args[index]
+        ctx.frames.append(frame)
+        ctx.inline_frames.append(False)
+        try:
+            result = self.do_block(fn.body)
+        except ReturnSignal as ret:
+            result = ret.value
+        finally:
+            ctx.frames.pop()
+            ctx.inline_frames.pop()
+            for param, previous in frame.items():
+                if previous is MISSING:
+                    syms.pop(param, None)
+                else:
+                    syms[param] = previous
+            ctx.depth = depth - 1
+        return result
+
     # -- blocks ----------------------------------------------------------
     # -- value collection (for ``@[ ... ]``) -----------------------------
     def emit(self, value: V.Value) -> None:
@@ -422,6 +467,15 @@ class Evaluator:
         finally:
             self.ctx.collectors.pop()
         return items
+
+    @property
+    def ast_module(self):
+        """The ``ast`` module, imported lazily (it imports us back)."""
+        module = self.__dict__.get("_ast_module")
+        if module is None:
+            from . import ast as module
+            self.__dict__["_ast_module"] = module
+        return module
 
     def do_block_unscoped(self, block: V.Value) -> V.Value:
         """Evaluate a block the way Arturo's ``execUnscoped`` does: statements
@@ -457,19 +511,24 @@ class Evaluator:
         return self.do_block(block, scoped=True)
 
     def _tree_for(self, block: V.Block):
-        from . import ast as A
-
         data = block.data
-        version = self.ctx.library._version
-        if (getattr(block, "_tree_data", None) is data
-                and getattr(block, "_tree_len", -1) == len(data)
-                and getattr(block, "_tree_version", None) == version):
+        library = self.ctx.library
+        # Everything that can change how the block is parsed has to be part of
+        # the key: the items themselves (identity *and* in-place mutation
+        # counter), the library, the user arity table and the runtime infix
+        # aliases.  Otherwise a redefinition of a function (or of an operator)
+        # silently reuses the tree built with the old arities.
+        ast_module = self.__dict__.get("_ast_module")
+        if ast_module is None:
+            ast_module = self.ast_module
+        key = (data, len(data), getattr(data, "version", None),
+               library._version, library.user_arities.version,
+               ast_module.DYNAMIC_INFIX.version)
+        if getattr(block, "_tree_key", None) == key:
             return block._tree
-        tree = A.build(block, self.ctx.library, self.ctx.syms)
+        tree = ast_module.build(block, library, self.ctx.syms)
         block._tree = tree
-        block._tree_data = data
-        block._tree_len = len(data)
-        block._tree_version = version
+        block._tree_key = key
         return tree
 
     # -- helpers for builtins -------------------------------------------
@@ -507,6 +566,26 @@ class Evaluator:
 
             return getter, setter
         raise ArturoError("Value Error", "Given value is not a literal")
+
+
+def _fast_call_plan(fn: V.Function):
+    """Parameter names for the compact call path, or ``None`` if unsupported."""
+    if fn.inline or fn.memoize or fn.impl is not None:
+        return None
+    if getattr(fn, "param_types", None) or getattr(fn, "exports", None) is not None:
+        return None
+    if getattr(fn, "imports", None):
+        return None
+    if not isinstance(fn.body, V.Block):
+        return None
+    names = []
+    for param in fn.params:
+        if isinstance(param, V.Type):
+            return None
+        if not isinstance(param, (V.Word, V.Literal)):
+            return None
+        names.append(param.data)
+    return names
 
 
 def param_name(param: V.Value) -> str:

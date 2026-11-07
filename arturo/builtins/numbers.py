@@ -125,56 +125,174 @@ def _factorial(ev, args):
     return V.Integer(math.factorial(n))
 
 
+_PRIME_LIST_FACTOR_LIMIT = 10 ** 12
+
+
+_primes = []            # cached primes, ascending
+_primes_limit = 1       # ... up to and including this value
+
+
+def _prime_list(limit: int):
+    """Every prime ``<= limit`` (cached, backed by the shared sieve)."""
+    global _primes_limit
+    if limit > _primes_limit:
+        if limit > _SIEVE_CAP:
+            return _local_primes(limit)
+        if _sieve_limit <= limit:
+            _sieve_grow(max(limit + 1, _SIEVE_MIN))
+        flags = _sieve_flags
+        _primes.extend(i for i in range(_primes_limit + 1, limit + 1) if flags[i])
+        _primes_limit = limit
+    return _primes
+
+
+def _local_primes(limit: int):
+    flags = bytearray(b"\x01") * (limit + 1)
+    flags[0:2] = b"\x00\x00"
+    for i in range(2, math.isqrt(limit) + 1):
+        if flags[i]:
+            flags[i * i::i] = b"\x00" * len(flags[i * i::i])
+    return [i for i in range(2, limit + 1) if flags[i]]
+
+
+def _factorize(n: int):
+    """Prime factorisation of ``n`` as ``[(prime, exponent), ...]``."""
+    factors = []
+    remaining = n
+    for p in _prime_list(math.isqrt(n)):
+        if p * p > remaining:
+            break
+        if remaining % p == 0:
+            exponent = 0
+            while remaining % p == 0:
+                remaining //= p
+                exponent += 1
+            factors.append((p, exponent))
+    if remaining > 1:
+        factors.append((remaining, 1))
+    return factors
+
+
+def _all_divisors(n: int, prime_only: bool = False):
+    """Divisors of ``n`` in ascending order (or its prime factors)."""
+    if n < 1:
+        return []
+    if n > _PRIME_LIST_FACTOR_LIMIT:
+        # trial division by every integer is the only option for huge inputs
+        if prime_only:
+            out = []
+            d = 2
+            while d * d <= n:
+                while n % d == 0:
+                    out.append(d)
+                    n //= d
+                d += 1 if d == 2 else 2
+            if n > 1:
+                out.append(n)
+            return out
+        out = []
+        i = 1
+        while i * i <= n:
+            if n % i == 0:
+                out.append(i)
+                if i != n // i:
+                    out.append(n // i)
+            i += 1
+        return sorted(out)
+    factors = _factorize(n)
+    if prime_only:
+        out = []
+        for prime, exponent in factors:
+            out.extend([prime] * exponent)
+        return out
+    divisors = [1]
+    for prime, exponent in factors:
+        power = 1
+        extension = []
+        for _ in range(exponent):
+            power *= prime
+            extension.extend([d * power for d in divisors])
+        divisors.extend(extension)
+    divisors.sort()
+    return divisors
+
+
 @builtin("factors", arity=1, attrs=["prime"])
 def _factors(ev, args):
     """``factors`` - all divisors; ``factors.prime`` - prime factorisation."""
-    n = abs(to_int(args[0]))
-    if attr_true(ev, "prime"):
-        out = []
-        d = 2
-        while d * d <= n:
-            while n % d == 0:
-                out.append(V.Integer(d))
-                n //= d
-            d += 1 if d == 2 else 2
-        if n > 1:
-            out.append(V.Integer(n))
-        return V.Block(out)
-    out = []
-    i = 1
-    while i * i <= n:
-        if n % i == 0:
-            out.append(V.Integer(i))
-            if i != n // i:
-                out.append(V.Integer(n // i))
-        i += 1
-    return V.Block(sorted(out, key=lambda v: v.data))
-
+    values = _all_divisors(abs(to_int(args[0])), attr_true(ev, "prime"))
+    return V.Block([V.Integer(v) for v in values])
 
 
 @impl("divisors")
 def _divisors(ev, args):
-    n = abs(to_int(args[0]))
-    result = []
-    i = 1
-    while i * i <= n:
-        if n % i == 0:
-            result.append(V.Integer(i))
-            if i != n // i:
-                result.append(V.Integer(n // i))
-        i += 1
-    return V.Block(sorted(result, key=lambda v: v.data))
+    values = _all_divisors(abs(to_int(args[0])))
+    return V.Block([V.Integer(v) for v in values])
 
 
 _MR_BASES_SMALL = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
-def _is_prime(n: int) -> bool:
-    """Trial division for small numbers, Miller-Rabin beyond that.
+# ---------------------------------------------------------------------------
+# Dense primality
+# ---------------------------------------------------------------------------
+# Programs that filter ranges with ``prime?`` ask the same question millions of
+# times, always for (nearly) the same bounded domain.  Trial division is then
+# the bottleneck, so once the queries look dense we answer them from a lazily
+# grown segmented sieve instead.  Big/sparse queries keep using trial division
+# and Miller-Rabin, so error semantics are untouched.
+_SIEVE_CAP = 32_000_000     # largest number we are willing to keep flags for
+_SIEVE_MIN = 1 << 16        # first block size
+_SIEVE_EAGER = 1 << 20      # always sieve up to here (1 MiB of flags)
+_SIEVE_DENSE_AFTER = 512    # ... and beyond it after this many queries
 
-    The reference implementation switches to GMP's ``probablyPrime`` for
-    big integers, so a probabilistic test is exactly what Arturo does.
-    """
+_sieve_flags = None         # bytearray: flags[n] is 1 when n is prime
+_sieve_limit = 0            # exclusive upper bound of the sieved window
+_sieve_calls = 0
+
+
+def _sieve_grow(target: int) -> None:
+    """Extend the sieve window to cover ``[0, target)``."""
+    global _sieve_flags, _sieve_limit
+    target = min(target, _SIEVE_CAP)
+    limit = _sieve_limit
+    flags = _sieve_flags
+    if flags is None or limit == 0:
+        flags = bytearray(b"\x01" * max(target, 2))
+        flags[0] = 0
+        if target > 1:
+            flags[1] = 0
+        root = math.isqrt(max(target, 2) - 1)
+        for i in range(2, root + 1):
+            if flags[i]:
+                start = i * i
+                flags[start:target:i] = b"\x00" * (((target - 1 - start) // i) + 1)
+        _sieve_flags = flags
+        _sieve_limit = target
+        return
+    if target <= limit:
+        return
+    flags.extend(b"\x01" * (target - limit))
+    root = math.isqrt(target - 1)
+    # every prime up to ``root`` is already flagged in the old window
+    for p in range(2, root + 1):
+        if flags[p]:
+            start = max(p * p, ((limit + p - 1) // p) * p)
+            if start < target:
+                flags[start:target:p] = b"\x00" * (((target - 1 - start) // p) + 1)
+    _sieve_limit = target
+
+
+def _sieve_prime(n: int) -> bool:
+    """``n`` within the sieved window, growing it when needed."""
+    if n >= _sieve_limit:
+        _sieve_grow(min(_SIEVE_CAP, max(n + 1, _SIEVE_MIN, _sieve_limit * 2)))
+    if n >= _sieve_limit:  # pragma: no cover - capped
+        return _trial_division_prime(n)
+    return bool(_sieve_flags[n])
+
+
+def _trial_division_prime(n: int) -> bool:
     if n < 2:
         return False
     for p in _MR_BASES_SMALL:
@@ -212,6 +330,25 @@ def _is_prime(n: int) -> bool:
         else:
             return False
     return True
+
+
+def _is_prime(n: int) -> bool:
+    """Primality of ``n`` - dense small queries are answered by a sieve.
+
+    The reference implementation switches to GMP's ``probablyPrime`` for big
+    integers, so a probabilistic test above the sieve window is exactly what
+    Arturo does.
+    """
+    global _sieve_calls
+    if n < 2:
+        return False
+    if n < _SIEVE_CAP:
+        if n < _sieve_limit:
+            return bool(_sieve_flags[n])
+        if n <= _SIEVE_EAGER or _sieve_calls >= _SIEVE_DENSE_AFTER:
+            return _sieve_prime(n)
+    _sieve_calls += 1
+    return _trial_division_prime(n)
 
 
 @impl("prime?")
@@ -259,6 +396,16 @@ def _digits(ev, args):
     if base is not None and value.kind == "integer":
         b = to_int(base)
         n = abs(value.data)
+        if b > 1:
+            out = []
+            append = out.append
+            while True:
+                n, digit = divmod(n, b)
+                append(digit)
+                if n == 0:
+                    break
+            out.reverse()
+            return V.Block([V.Integer(d) for d in out])
         out = []
         while True:
             out.append(V.Integer(n % b))

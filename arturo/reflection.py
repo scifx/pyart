@@ -8,15 +8,34 @@ on a separate Arturo executable or on network access.
 from __future__ import annotations
 
 import json
+import os
 import re
-from pathlib import Path
 from typing import Any
 
 from . import values as V
 from .signatures import SIGNATURES
 
-with (Path(__file__).with_name("builtin_docs.json")).open(encoding="utf-8") as _fh:
-    BUILTIN_DOCS = json.load(_fh)
+_DOCS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "builtin_docs.json")
+_BUILTIN_DOCS = None
+
+
+def builtin_docs() -> dict:
+    """The generated builtin metadata, loaded on first use.
+
+    It is a 400 KiB JSON document; parsing it eagerly costs more than half of
+    the startup time of a short script and only reflection needs it.
+    """
+    global _BUILTIN_DOCS
+    if _BUILTIN_DOCS is None:
+        with open(_DOCS_PATH, encoding="utf-8") as fh:
+            _BUILTIN_DOCS = json.load(fh)
+    return _BUILTIN_DOCS
+
+
+def __getattr__(name):
+    if name == "BUILTIN_DOCS":
+        return builtin_docs()
+    raise AttributeError(name)
 
 
 def parse_user_doc_comments(block: V.Block) -> dict[str, Any]:
@@ -170,7 +189,7 @@ def resolve_info_target(ev, value: V.Value):
 
 
 def _signature_args(fn: V.Function, name: str) -> dict[str, list[str]]:
-    docs = BUILTIN_DOCS.get(name)
+    docs = builtin_docs().get(name)
     if docs is not None:
         return {arg["name"]: arg["types"] for arg in docs["args"]}
     if hasattr(fn, "param_types"):
@@ -183,7 +202,7 @@ def _signature_args(fn: V.Function, name: str) -> dict[str, list[str]]:
 
 
 def _attribute_specs(fn: V.Function, name: str) -> list[dict]:
-    docs = BUILTIN_DOCS.get(name)
+    docs = builtin_docs().get(name)
     if docs is not None:
         return docs["attrs"]
     user = getattr(fn, "doc", {}).get("options", [])
@@ -206,7 +225,7 @@ def metadata_for(name: str, requested: str, value: V.Value) -> V.Dictionary:
     if not isinstance(value, V.Function):
         return V.Dictionary(info)
 
-    docs = BUILTIN_DOCS.get(name, {})
+    docs = builtin_docs().get(name, {})
     user = getattr(value, "doc", {})
     description = user.get("description") or docs.get("description")
     module = docs.get("module")
